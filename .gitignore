@@ -1,0 +1,20 @@
+# libdragon / build outputs
+build/
+*.z64
+*.elf
+*.dfs
+*.map
+*.v64
+*.n64
+
+# local toolchain wrapper state
+.libdragon/
+libdragon/
+node_modules/
+package-lock.json
+
+# private retail game data; do not commit
+SW.GRP
+SW.RTS
+*.GRP
+*.RTS

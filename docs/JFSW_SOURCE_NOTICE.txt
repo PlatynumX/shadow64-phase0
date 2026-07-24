@@ -1,0 +1,5 @@
+JFSW reference source vendored by scripts/fetch_jfsw_reference.sh
+Upstream URL: https://github.com/jonof/jfsw.git
+Commit: befcdd01afe5151cac2f1dabf0a7256c42537284
+
+This source is included so Shadow64 can be ported against the real JFSW/JFBuild codebase instead of guessed structs and behavior. Keep the Shadow64 repo private while it also contains game-derived asset banks.

@@ -1,0 +1,21 @@
+# Shadow64 Phase 0 R11 Release Notes
+
+R11 locks the project back onto the software renderer route.
+
+New in R11:
+
+- Stable repo remains `shadow64-phase0`.
+- ROM output is `shadow64_phase0_r11.z64`.
+- Renderer is explicitly CPU/software-only.
+- No libdragon preview branch.
+- No OpenGL route.
+- No RDP triangle renderer route.
+- Keeps the R09/R10 first-person wall renderer skeleton alive as the boot baseline.
+- Debug overlay now states the active renderer path.
+- JFSW/JFBuild remains the long-term source reference, but not through an OpenGL/Polymost-style path.
+
+Expected test result:
+
+- First-person $DMWOODS.MAP wall view boots.
+- Real packed Shadow Warrior wall textures draw through software columns.
+- B toggles top-down debug view.

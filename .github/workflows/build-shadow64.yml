@@ -1,0 +1,214 @@
+name: Build Shadow64 Phase 0 ROM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: build-rom-r11
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Manual checkout, restore after libdragon init, build
+        id: shadow64_build
+        env:
+          GH_TOKEN_FOR_CHECKOUT: ${{ github.token }}
+        run: |
+          set -u
+          REV="R11"
+          PROJECT="shadow64_phase0_r11"
+          WORKBASE="$GITHUB_WORKSPACE"
+          PROJECT_ROOT="$WORKBASE/project"
+          RESULTS="$WORKBASE/_shadow64_results/run-$GITHUB_RUN_ID"
+          mkdir -p "$RESULTS/logs" "$RESULTS/artifact"
+          echo "results_dir=$RESULTS" >> "$GITHUB_OUTPUT"
+          echo "status_file=$RESULTS/status.txt" >> "$GITHUB_OUTPUT"
+
+          step_status() {
+            local name="$1"; shift
+            echo "== $name =="
+            "$@"
+          }
+
+          echo "Shadow64 $REV build started" | tee "$RESULTS/logs/00-start.txt"
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "repo=$GITHUB_REPOSITORY"
+            echo "sha=$GITHUB_SHA"
+            echo "workspace=$GITHUB_WORKSPACE"
+            echo "runner=$RUNNER_OS"
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            uname -a
+          } | tee -a "$RESULTS/logs/00-start.txt"
+
+          CHECKOUT_STATUS=0
+          {
+            set -u
+            rm -rf "$PROJECT_ROOT"
+            git clone --depth=1 "https://x-access-token:${GH_TOKEN_FOR_CHECKOUT}@github.com/${GITHUB_REPOSITORY}.git" "$PROJECT_ROOT"
+            cd "$PROJECT_ROOT"
+            git fetch --depth=1 origin "$GITHUB_SHA"
+            git checkout --detach "$GITHUB_SHA"
+            git config --global --add safe.directory "$PROJECT_ROOT"
+            test -f Makefile
+            test -f src/main.c
+            test -f filesystem/dmwoods.s64b
+          } > "$RESULTS/logs/01-manual-checkout.log" 2>&1 || CHECKOUT_STATUS=$?
+
+          VALIDATE_STATUS=0
+          if [ "$CHECKOUT_STATUS" = "0" ]; then
+            (cd "$PROJECT_ROOT" && bash scripts/validate_shadow64_package.sh) > "$RESULTS/logs/02-validate.log" 2>&1 || VALIDATE_STATUS=$?
+          else
+            echo "Skipped validate because checkout failed." > "$RESULTS/logs/02-validate.log"
+          fi
+
+          NODE_STATUS=0
+          if [ "$CHECKOUT_STATUS" = "0" ]; then
+            {
+              set -u
+              echo "PATH=$PATH"
+              command -v node || true
+              node --version || true
+              command -v npm || true
+              npm --version || true
+              if ! command -v npm >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y nodejs npm
+              fi
+              node --version
+              npm --version
+            } > "$RESULTS/logs/03-node-npm.log" 2>&1 || NODE_STATUS=$?
+          else
+            echo "Skipped Node setup because checkout failed." > "$RESULTS/logs/03-node-npm.log"
+          fi
+
+          LIBDRAGON_INSTALL_STATUS=0
+          if [ "$CHECKOUT_STATUS" = "0" ] && [ "$NODE_STATUS" = "0" ]; then
+            {
+              set -u
+              npm install -g libdragon@latest
+              command -v libdragon
+              libdragon --version || true
+            } > "$RESULTS/logs/04-install-libdragon.log" 2>&1 || LIBDRAGON_INSTALL_STATUS=$?
+          else
+            echo "Skipped libdragon install because checkout/node failed." > "$RESULTS/logs/04-install-libdragon.log"
+          fi
+
+          LIBDRAGON_INIT_STATUS=0
+          RESTORE_STATUS=0
+          if [ "$CHECKOUT_STATUS" = "0" ] && [ "$LIBDRAGON_INSTALL_STATUS" = "0" ]; then
+            {
+              set -u
+              cd "$PROJECT_ROOT"
+              tar --exclude='.git' --exclude='libdragon' --exclude='node_modules' --exclude='build' --exclude='*.z64' -czf "$RUNNER_TEMP/shadow64-project-source.tar.gz" .
+              libdragon init --branch trunk
+            } > "$RESULTS/logs/05-libdragon-init.log" 2>&1 || LIBDRAGON_INIT_STATUS=$?
+            if [ "$LIBDRAGON_INIT_STATUS" = "0" ]; then
+              {
+                set -u
+                cd "$PROJECT_ROOT"
+                tar -xzf "$RUNNER_TEMP/shadow64-project-source.tar.gz" -C "$PROJECT_ROOT"
+                test -f Makefile
+                test -f src/main.c
+                test -f filesystem/dmwoods.s64b
+                echo "Restored Shadow64 project files after libdragon init."
+                echo "Makefile first lines:"
+                sed -n '1,80p' Makefile
+              } > "$RESULTS/logs/05b-restore-project-after-init.log" 2>&1 || RESTORE_STATUS=$?
+            else
+              echo "Skipped restore because libdragon init failed." > "$RESULTS/logs/05b-restore-project-after-init.log"
+            fi
+          else
+            echo "Skipped libdragon init because earlier step failed." > "$RESULTS/logs/05-libdragon-init.log"
+            echo "Skipped restore because earlier step failed." > "$RESULTS/logs/05b-restore-project-after-init.log"
+          fi
+
+          BUILD_STATUS=0
+          if [ "$CHECKOUT_STATUS" = "0" ] && [ "$VALIDATE_STATUS" = "0" ] && [ "$LIBDRAGON_INIT_STATUS" = "0" ] && [ "$RESTORE_STATUS" = "0" ]; then
+            (cd "$PROJECT_ROOT" && libdragon make) > "$RESULTS/logs/06-libdragon-make.log" 2>&1 || BUILD_STATUS=$?
+          else
+            echo "Skipped build because earlier step failed." > "$RESULTS/logs/06-libdragon-make.log"
+          fi
+
+          COLLECT_STATUS=0
+          COPY_STATUS=0
+          ROM_PRESENT=0
+          {
+            echo "Files after build:"
+            find "$PROJECT_ROOT" -maxdepth 5 -type f | sort
+          } > "$RESULTS/logs/07-post-build-file-list.txt" 2>&1 || COLLECT_STATUS=$?
+
+          {
+            set -u
+            cd "$PROJECT_ROOT"
+            for f in \
+              "$PROJECT.z64" \
+              "build/$PROJECT.elf" \
+              "build/$PROJECT.elf.sym" \
+              "build/$PROJECT.map" \
+              "build/$PROJECT.dfs"; do
+              if [ -f "$f" ]; then
+                cp -v "$f" "$RESULTS/artifact/"
+              fi
+            done
+            if [ -f "$RESULTS/artifact/$PROJECT.z64" ]; then
+              ROM_PRESENT=1
+            fi
+            if find "$RESULTS/artifact" -maxdepth 1 -type f | grep -q .; then
+              sha256sum "$RESULTS"/artifact/* > "$RESULTS/artifact/SHA256SUMS.txt" 2>/dev/null || true
+            fi
+          } > "$RESULTS/logs/08-copy-build-outputs.log" 2>&1 || COPY_STATUS=$?
+
+          MAIN_FAIL=0
+          if [ "$CHECKOUT_STATUS" != "0" ] || [ "$VALIDATE_STATUS" != "0" ] || [ "$NODE_STATUS" != "0" ] || [ "$LIBDRAGON_INSTALL_STATUS" != "0" ] || [ "$LIBDRAGON_INIT_STATUS" != "0" ] || [ "$RESTORE_STATUS" != "0" ] || [ "$BUILD_STATUS" != "0" ] || [ "$COPY_STATUS" != "0" ] || [ "$ROM_PRESENT" != "1" ]; then
+            MAIN_FAIL=1
+          fi
+
+          {
+            echo "checkout_status=$CHECKOUT_STATUS"
+            echo "validate_status=$VALIDATE_STATUS"
+            echo "node_status=$NODE_STATUS"
+            echo "libdragon_install_status=$LIBDRAGON_INSTALL_STATUS"
+            echo "libdragon_init_status=$LIBDRAGON_INIT_STATUS"
+            echo "restore_status=$RESTORE_STATUS"
+            echo "build_status=$BUILD_STATUS"
+            echo "collect_status=$COLLECT_STATUS"
+            echo "copy_status=$COPY_STATUS"
+            echo "rom_present=$ROM_PRESENT"
+            echo "main_fail=$MAIN_FAIL"
+          } | tee "$RESULTS/status.txt"
+
+          tar -czf "$RESULTS/${PROJECT}_results.tar.gz" -C "$RESULTS" logs artifact status.txt
+          echo "Shadow64 $REV shell step complete; final-status step will decide pass/fail after artifacts upload."
+
+      - name: Upload Shadow64 build results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow64-r11-results-${{ github.run_id }}
+          path: ${{ steps.shadow64_build.outputs.results_dir }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final status
+        if: always()
+        run: |
+          STATUS_FILE="${{ steps.shadow64_build.outputs.status_file }}"
+          if [ -f "$STATUS_FILE" ]; then
+            cat "$STATUS_FILE"
+            if grep -q '^main_fail=0$' "$STATUS_FILE"; then
+              echo "Shadow64 R11 build succeeded."
+              exit 0
+            fi
+          else
+            echo "Missing status file: $STATUS_FILE"
+          fi
+          echo "Shadow64 R11 build failed, but logs/artifacts should be available."
+          exit 1
