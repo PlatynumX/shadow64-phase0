@@ -1,62 +1,38 @@
 #include <libdragon.h>
+
+#include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <stdbool.h>
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define BANK_PATH "/dmwoods.s64b"
-#define NEAR_Z 128
-#define FAR_Z 65536
-#define FOCAL 192
-#define HORIZON 108
-#define MAX_RENDER_WALLS 512
-#define SHADOW64_SOFTWARE_RENDERER_ONLY 1
+#define VIEW_TOP 0
+#define VIEW_BOTTOM 218
+#define VIEW_H (VIEW_BOTTOM - VIEW_TOP)
+#define HORIZON 112
+#define FOCAL 150.0f
+#define NEAR_PLANE 48.0f
+#define BUILD_ANGLE_COUNT 2048
+#define BUILD_PI 3.14159265358979323846f
+#define MAP_PATH "rom:/sw_first.map"
+#define TEX_PATH "rom:/sw_r12_tex.bin"
+#define PLAYER_EYE_OFFSET (40 * 256)
+#define MAX_VISIBLE_SECTORS 128
+#define MAX_PORTAL_DEPTH 10
+#define SWORD_REST 2080
+#define SWORD_SWING0 2081
+#define SWORD_SWING1 2082
+#define SWORD_SWING2 2083
+#define TILE_TRANSPARENT 255
 
-/*
- * R11 deliberately stays on the CPU/software renderer path. No libdragon
- * preview branch, no OpenGL, no RDP triangle path. This keeps the baseline
- * close to Build/JFBuild: project walls, draw vertical columns, sample ART
- * tiles in their native column-major layout, and keep top-down debugging.
- */
-
-typedef struct __attribute__((packed)) {
-    char magic[4];
-    uint16_t version;
-    uint16_t flags;
-    uint32_t palette_offset;
-    uint32_t palette_size;
-    uint32_t map_offset;
-    uint32_t map_size;
-    uint32_t tile_dir_offset;
-    uint32_t tile_count;
-    uint32_t tile_data_offset;
-    uint32_t tile_data_size;
-    int32_t start_x;
-    int32_t start_y;
-    int32_t start_z;
-    int32_t start_reserved;
-    uint16_t start_ang;
-    uint16_t start_sector;
-    uint16_t num_sectors;
-    uint16_t num_walls;
-    uint32_t num_sprites;
-    uint32_t sector_size;
-    uint32_t wall_size;
-    uint32_t sprite_size;
-    uint32_t tile_entry_size;
-    uint32_t map_crc32;
-    uint32_t tile_crc32;
-    uint32_t reserved0;
-    uint8_t reserved1[32];
-} s64_bank_header_t;
-
-typedef struct __attribute__((packed)) {
+/* Build v7/v8 fields used by R12. Layout follows jfbuild/include/build.h. */
+typedef struct {
     int16_t wallptr, wallnum;
     int32_t ceilingz, floorz;
-    uint16_t ceilingstat, floorstat;
+    int16_t ceilingstat, floorstat;
     int16_t ceilingpicnum, ceilingheinum;
     int8_t ceilingshade;
     uint8_t ceilingpal, ceilingxpanning, ceilingypanning;
@@ -65,484 +41,346 @@ typedef struct __attribute__((packed)) {
     uint8_t floorpal, floorxpanning, floorypanning;
     uint8_t visibility, filler;
     int16_t lotag, hitag, extra;
-} s64_sector_t;
+} map_sector_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     int32_t x, y;
-    int16_t point2, nextwall, nextsector, cstat, picnum, overpicnum;
+    int16_t point2, nextwall, nextsector, cstat;
+    int16_t picnum, overpicnum;
     int8_t shade;
     uint8_t pal, xrepeat, yrepeat, xpanning, ypanning;
     int16_t lotag, hitag, extra;
-} s64_wall_t;
+    int16_t owner_sector;
+} map_wall_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     int32_t x, y, z;
     int16_t cstat, picnum;
     int8_t shade;
     uint8_t pal, clipdist, filler, xrepeat, yrepeat;
     int8_t xoffset, yoffset;
     int16_t sectnum, statnum, ang, owner, xvel, yvel, zvel, lotag, hitag, extra;
-} s64_sprite_t;
-
-typedef struct __attribute__((packed)) {
-    uint16_t picnum;
-    uint16_t w;
-    uint16_t h;
-    uint16_t reserved;
-    uint32_t data_offset;
-    uint32_t data_size;
-    uint32_t picanm;
-} s64_tile_t;
+    int8_t hp;
+    bool dead;
+    bool pickup_taken;
+    uint8_t attack_cooldown;
+} map_sprite_t;
 
 typedef struct {
-    int sx1, sx2;
-    int yceil1, yceil2;
-    int yfloor1, yfloor2;
-    int zavg;
-    uint16_t picnum;
-    uint8_t pal;
-    uint8_t portal;
-} render_wall_t;
+    int version;
+    int32_t start_x, start_y, start_z;
+    int16_t start_angle, start_sector;
+    int16_t sector_count, wall_count, sprite_count;
+    map_sector_t *sectors;
+    map_wall_t *walls;
+    map_sprite_t *sprites;
+    int32_t min_x, min_y, max_x, max_y;
+} map_data_t;
 
-_Static_assert(sizeof(s64_bank_header_t) == 128, "bad bank header size");
-_Static_assert(sizeof(s64_sector_t) == 40, "bad sector size");
-_Static_assert(sizeof(s64_wall_t) == 32, "bad wall size");
-_Static_assert(sizeof(s64_sprite_t) == 44, "bad sprite size");
-_Static_assert(sizeof(s64_tile_t) == 20, "bad tile entry size");
+typedef struct {
+    int32_t x, y, z;
+    int16_t angle, sector;
+    int health;
+    int armor;
+    int kills;
+    int pickups;
+    int sword_timer;
+    int damage_flash;
+} player_t;
 
-static uint8_t *g_bank;
-static const s64_bank_header_t *g_hdr;
-static const uint8_t *g_palette;
-static const s64_sector_t *g_sectors;
-static const s64_wall_t *g_walls;
-static const s64_sprite_t *g_sprites;
-static const s64_tile_t *g_tiles;
-static const uint8_t *g_tile_pixels;
-static uint32_t g_pal_rgba[256];
+typedef struct {
+    uint16_t id, w, h, flags;
+    uint32_t picanm;
+    uint32_t data_offset, data_size;
+    const uint8_t *pixels;
+    uint8_t avg_index;
+} texture_t;
 
-static int32_t cam_x, cam_y, cam_z;
-static uint16_t cam_ang;
-static int zoom = 6;
-static int view_mode = 0; /* 0 = first person, 1 = map */
-static int show_help = 1;
-static int g_last_render_walls = 0;
+typedef struct {
+    uint8_t *blob;
+    size_t blob_size;
+    uint8_t palette[768];
+    uint16_t palette16[32][256];
+    texture_t *tiles;
+    uint32_t tile_count;
+} texture_bank_t;
 
-/* 0..90 degree sine, 33 samples, scaled by 1024. */
-static const int16_t sin_quarter_1024[33] = {
-    0, 50, 100, 150, 200, 249, 297, 345, 392, 438, 483, 526, 569, 610, 650, 688,
-    724, 759, 792, 822, 851, 878, 903, 926, 946, 964, 980, 993, 1004, 1013, 1019, 1023, 1024
-};
+typedef struct { int16_t sector; uint8_t depth; } sector_queue_t;
 
-static int16_t isin1024(uint16_t angle) {
-    uint16_t a = angle & 2047;
-    int sign = 1;
-    if (a >= 1024) { a -= 1024; sign = -1; }
-    if (a > 512) a = 1024 - a;
-    int idx = a >> 4;
-    if (idx >= 32) return sign * 1024;
-    int frac = a & 15;
-    int v0 = sin_quarter_1024[idx];
-    int v1 = sin_quarter_1024[idx + 1];
-    return (int16_t)(sign * (v0 + ((v1 - v0) * frac >> 4)));
+static map_data_t g_map;
+static texture_bank_t g_tex;
+static player_t g_player;
+static bool g_overhead = false;
+static char g_status[192] = "boot";
+static float g_zbuf[SCREEN_W * VIEW_H];
+static bool g_sector_visible[4096];
+static uint32_t g_frame = 0;
+
+static int16_t le_i16(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
+static uint16_t le_u16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static int32_t le_i32(const uint8_t *p) { return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)); }
+static uint32_t le_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static bool read_exact(FILE *fp, void *dst, size_t size) { return fread(dst, 1, size, fp) == size; }
+static bool read_i16(FILE *fp, int16_t *out) { uint8_t b[2]; if (!read_exact(fp,b,2)) return false; *out=le_i16(b); return true; }
+static bool read_i32(FILE *fp, int32_t *out) { uint8_t b[4]; if (!read_exact(fp,b,4)) return false; *out=le_i32(b); return true; }
+
+static uint16_t pack_rgb16(int r, int g, int b) {
+    if (r < 0) r = 0;
+    if (r > 31) r = 31;
+    if (g < 0) g = 0;
+    if (g > 31) g = 31;
+    if (b < 0) b = 0;
+    if (b > 31) b = 31;
+    return (uint16_t)((r << 11) | (g << 6) | (b << 1) | 1);
 }
 
-static int16_t icos1024(uint16_t angle) {
-    return isin1024(angle + 512);
+static int shade_level(int8_t shade) {
+    int level = 28 - ((int)shade / 4);
+    if (level < 3) level = 3;
+    if (level > 31) level = 31;
+    return level;
 }
 
-static uint32_t make_pal_color(uint8_t idx) {
-    const uint8_t *p = &g_palette[idx * 3];
-    int r = p[0], g = p[1], b = p[2];
-    if (r <= 63 && g <= 63 && b <= 63) {
-        r <<= 2; g <<= 2; b <<= 2;
+static void free_map(map_data_t *m) {
+    free(m->sectors); free(m->walls); free(m->sprites); memset(m, 0, sizeof(*m));
+}
+static void free_textures(texture_bank_t *t) {
+    free(t->tiles); free(t->blob); memset(t, 0, sizeof(*t));
+}
+
+static bool fail_load(FILE *fp, const char *reason) {
+    if (fp) fclose(fp);
+    snprintf(g_status, sizeof(g_status), "LOAD ERROR: %s", reason);
+    debugf("Shadow64 R12: %s\n", g_status);
+    return false;
+}
+
+static bool load_map(const char *path, map_data_t *m) {
+    uint8_t raw[44]; FILE *fp = NULL; int32_t version; int16_t count;
+    free_map(m);
+    fp = fopen(path, "rb"); if (!fp) return fail_load(NULL, "map missing");
+    if (!read_i32(fp, &version) || (version != 7 && version != 8)) return fail_load(fp, "bad map version");
+    m->version = version;
+    if (!read_i32(fp,&m->start_x)||!read_i32(fp,&m->start_y)||!read_i32(fp,&m->start_z)||!read_i16(fp,&m->start_angle)||!read_i16(fp,&m->start_sector)) return fail_load(fp,"short map header");
+    if (!read_i16(fp,&count) || count<=0 || count>(version==7?1024:4096)) return fail_load(fp,"bad sector count");
+    m->sector_count=count; m->sectors=calloc((size_t)count,sizeof(*m->sectors)); if(!m->sectors) return fail_load(fp,"sector alloc");
+    for(int i=0;i<count;i++){
+        if(!read_exact(fp,raw,40)) return fail_load(fp,"short sectors");
+        map_sector_t *s=&m->sectors[i];
+        s->wallptr=le_i16(raw+0); s->wallnum=le_i16(raw+2); s->ceilingz=le_i32(raw+4); s->floorz=le_i32(raw+8);
+        s->ceilingstat=le_i16(raw+12); s->floorstat=le_i16(raw+14); s->ceilingpicnum=le_i16(raw+16); s->ceilingheinum=le_i16(raw+18);
+        s->ceilingshade=(int8_t)raw[20]; s->ceilingpal=raw[21]; s->ceilingxpanning=raw[22]; s->ceilingypanning=raw[23];
+        s->floorpicnum=le_i16(raw+24); s->floorheinum=le_i16(raw+26); s->floorshade=(int8_t)raw[28]; s->floorpal=raw[29]; s->floorxpanning=raw[30]; s->floorypanning=raw[31];
+        s->visibility=raw[32]; s->filler=raw[33]; s->lotag=le_i16(raw+34); s->hitag=le_i16(raw+36); s->extra=le_i16(raw+38);
     }
-    return graphics_make_color(r, g, b, 255);
+    if(!read_i16(fp,&count)||count<=0||count>(version==7?8192:16384)) return fail_load(fp,"bad wall count");
+    m->wall_count=count; m->walls=calloc((size_t)count,sizeof(*m->walls)); if(!m->walls) return fail_load(fp,"wall alloc");
+    m->min_x=INT32_MAX; m->min_y=INT32_MAX; m->max_x=INT32_MIN; m->max_y=INT32_MIN;
+    for(int i=0;i<count;i++){
+        if(!read_exact(fp,raw,32)) return fail_load(fp,"short walls");
+        map_wall_t *w=&m->walls[i];
+        w->x=le_i32(raw+0); w->y=le_i32(raw+4); w->point2=le_i16(raw+8); w->nextwall=le_i16(raw+10); w->nextsector=le_i16(raw+12); w->cstat=le_i16(raw+14);
+        w->picnum=le_i16(raw+16); w->overpicnum=le_i16(raw+18); w->shade=(int8_t)raw[20]; w->pal=raw[21]; w->xrepeat=raw[22]; w->yrepeat=raw[23]; w->xpanning=raw[24]; w->ypanning=raw[25];
+        w->lotag=le_i16(raw+26); w->hitag=le_i16(raw+28); w->extra=le_i16(raw+30); w->owner_sector=-1;
+        if(w->x<m->min_x)m->min_x=w->x;
+        if(w->x>m->max_x)m->max_x=w->x;
+        if(w->y<m->min_y)m->min_y=w->y;
+        if(w->y>m->max_y)m->max_y=w->y;
+    }
+    if(!read_i16(fp,&count)||count<0||count>(version==7?4096:16384)) return fail_load(fp,"bad sprite count");
+    m->sprite_count=count; m->sprites=calloc((size_t)count,sizeof(*m->sprites)); if(count && !m->sprites) return fail_load(fp,"sprite alloc");
+    for(int i=0;i<count;i++){
+        if(!read_exact(fp,raw,44)) return fail_load(fp,"short sprites");
+        map_sprite_t *s=&m->sprites[i];
+        s->x=le_i32(raw+0); s->y=le_i32(raw+4); s->z=le_i32(raw+8); s->cstat=le_i16(raw+12); s->picnum=le_i16(raw+14); s->shade=(int8_t)raw[16]; s->pal=raw[17]; s->clipdist=raw[18]; s->filler=raw[19];
+        s->xrepeat=raw[20]; s->yrepeat=raw[21]; s->xoffset=(int8_t)raw[22]; s->yoffset=(int8_t)raw[23]; s->sectnum=le_i16(raw+24); s->statnum=le_i16(raw+26); s->ang=le_i16(raw+28); s->owner=le_i16(raw+30); s->xvel=le_i16(raw+32); s->yvel=le_i16(raw+34); s->zvel=le_i16(raw+36); s->lotag=le_i16(raw+38); s->hitag=le_i16(raw+40); s->extra=le_i16(raw+42);
+        if(s->picnum==4096 || s->picnum==4162) s->hp=3; else if(s->picnum==1400 || s->picnum==1441) s->hp=4; else s->hp=0;
+    }
+    fclose(fp);
+    for(int si=0;si<m->sector_count;si++){
+        map_sector_t *s=&m->sectors[si]; int first=s->wallptr, end=first+s->wallnum;
+        if(first<0||s->wallnum<0||end>m->wall_count) return fail_load(NULL,"sector wall range");
+        for(int wi=first;wi<end;wi++)m->walls[wi].owner_sector=(int16_t)si;
+    }
+    for(int i=0;i<m->wall_count;i++) if(m->walls[i].point2<0||m->walls[i].point2>=m->wall_count) return fail_load(NULL,"bad point2");
+    snprintf(g_status,sizeof(g_status),"v%d sec:%d wall:%d spr:%d",m->version,m->sector_count,m->wall_count,m->sprite_count);
+    return true;
 }
 
-static void rebuild_palette_cache(void) {
-    for (int i = 0; i < 256; i++) {
-        g_pal_rgba[i] = make_pal_color((uint8_t)i);
-    }
-}
-
-static const s64_tile_t *find_tile(uint16_t picnum) {
-    for (uint32_t i = 0; i < g_hdr->tile_count; i++) {
-        if (g_tiles[i].picnum == picnum) return &g_tiles[i];
-    }
+static const texture_t *find_texture(uint16_t id) {
+    int lo=0, hi=(int)g_tex.tile_count-1;
+    while(lo<=hi){int mid=(lo+hi)>>1; uint16_t v=g_tex.tiles[mid].id; if(v==id)return &g_tex.tiles[mid]; if(v<id)lo=mid+1; else hi=mid-1;}
     return NULL;
 }
 
-static uint8_t tile_sample(const s64_tile_t *t, int x, int y) {
-    if (!t || !t->w || !t->h) return 0;
-    x %= t->w; if (x < 0) x += t->w;
-    y %= t->h; if (y < 0) y += t->h;
-    const uint8_t *pix = g_tile_pixels + t->data_offset;
-    /* Build ART tiles are column-major: offset = x * height + y. */
-    return pix[x * t->h + y];
+static bool load_texture_bank(const char *path, texture_bank_t *t) {
+    free_textures(t); FILE *fp=fopen(path,"rb"); if(!fp)return fail_load(NULL,"texture bank missing");
+    if(fseek(fp,0,SEEK_END)!=0)return fail_load(fp,"texture seek");
+    long sz=ftell(fp);
+    if(sz<28)return fail_load(fp,"texture bank short");
+    rewind(fp);
+    t->blob=malloc((size_t)sz); if(!t->blob)return fail_load(fp,"texture bank alloc"); t->blob_size=(size_t)sz;
+    if(!read_exact(fp,t->blob,t->blob_size)){free_textures(t);return fail_load(fp,"texture bank read");} fclose(fp);
+    const uint8_t *p=t->blob; if(memcmp(p,"S64TX12\0",8)!=0){free_textures(t);return fail_load(NULL,"texture magic");}
+    uint32_t version=le_u32(p+8), count=le_u32(p+12), palbytes=le_u32(p+16), descbytes=le_u32(p+20), pixbytes=le_u32(p+24);
+    if(version!=1||palbytes!=768||descbytes!=count*20u||28u+palbytes+descbytes+pixbytes>t->blob_size){free_textures(t);return fail_load(NULL,"texture bank layout");}
+    memcpy(t->palette,p+28,768); t->tile_count=count; t->tiles=calloc(count,sizeof(*t->tiles)); if(count&&!t->tiles){free_textures(t);return fail_load(NULL,"texture desc alloc");}
+    const uint8_t *d=p+28+768;
+    for(uint32_t i=0;i<count;i++,d+=20){
+        texture_t *x=&t->tiles[i]; x->id=le_u16(d); x->w=le_u16(d+2); x->h=le_u16(d+4); x->flags=le_u16(d+6); x->picanm=le_u32(d+8); x->data_offset=le_u32(d+12); x->data_size=le_u32(d+16);
+        if((size_t)x->data_offset+x->data_size>t->blob_size || x->data_size!=(uint32_t)x->w*x->h){free_textures(t);return fail_load(NULL,"texture descriptor bounds");}
+        x->pixels=t->blob+x->data_offset; uint32_t sum=0,n=0; for(uint32_t k=0;k<x->data_size;k++){uint8_t q=x->pixels[k]; if(q!=255){sum+=q;n++;}} x->avg_index=(uint8_t)(n?sum/n:0);
+    }
+    for(int level=0;level<32;level++)for(int i=0;i<256;i++){
+        int r=(t->palette[i*3+0]&63)>>1, g=(t->palette[i*3+1]&63)>>1, b=(t->palette[i*3+2]&63)>>1;
+        r=r*level/31; g=g*level/31; b=b*level/31; t->palette16[level][i]=pack_rgb16(r,g,b);
+    }
+    return true;
 }
 
-static void draw_tile_preview(surface_t *disp, int x0, int y0, uint16_t picnum, int scale) {
-    const s64_tile_t *t = find_tile(picnum);
-    if (!t) return;
+static uint8_t texel(const texture_t *t, int u, int v) {
+    if(!t||!t->pixels||t->w==0||t->h==0)return 0;
+    u%=t->w;
+    v%=t->h;
+    if(u<0)u+=t->w;
+    if(v<0)v+=t->h;
+    return t->pixels[u*t->h+v];
+}
 
-    int tw = t->w;
-    int th = t->h;
-    if (tw > 64) tw = 64;
-    if (th > 64) th = 64;
+static inline void raw_pixel(surface_t *s,int x,int y,uint16_t c){ if((unsigned)x>=SCREEN_W||(unsigned)y>=SCREEN_H)return; uint16_t *row=(uint16_t*)((uint8_t*)s->buffer+(size_t)y*s->stride); row[x]=c; }
+static inline void zpixel(surface_t *s,int x,int y,float z,uint16_t c){ if((unsigned)x>=SCREEN_W||y<VIEW_TOP||y>=VIEW_BOTTOM)return; int idx=(y-VIEW_TOP)*SCREEN_W+x; if(z<g_zbuf[idx]){g_zbuf[idx]=z;raw_pixel(s,x,y,c);} }
 
-    for (int y = 0; y < th; y++) {
-        for (int x = 0; x < tw; x++) {
-            uint8_t idx = tile_sample(t, x, y);
-            uint32_t c = g_pal_rgba[idx];
-            for (int yy = 0; yy < scale; yy++) {
-                for (int xx = 0; xx < scale; xx++) {
-                    int sx = x0 + x * scale + xx;
-                    int sy = y0 + y * scale + yy;
-                    if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H) {
-                        graphics_draw_pixel(disp, sx, sy, c);
-                    }
-                }
-            }
+static bool point_inside_sector(const map_data_t *m,int32_t x,int32_t y,int si){
+    if(si<0||si>=m->sector_count)return false;
+    const map_sector_t *s=&m->sectors[si];
+    bool inside=false;
+    for(int n=0;n<s->wallnum;n++){const map_wall_t *a=&m->walls[s->wallptr+n],*b=&m->walls[a->point2]; if((a->y>y)!=(b->y>y)){double ix=(double)(b->x-a->x)*(double)(y-a->y)/(double)(b->y-a->y)+(double)a->x; if((double)x<ix)inside=!inside;}}
+    return inside;
+}
+static int16_t find_sector(const map_data_t *m,int32_t x,int32_t y,int16_t hint){
+    if(point_inside_sector(m,x,y,hint))return hint;
+    if(hint>=0&&hint<m->sector_count){const map_sector_t*s=&m->sectors[hint];for(int n=0;n<s->wallnum;n++){int16_t ns=m->walls[s->wallptr+n].nextsector;if(ns>=0&&point_inside_sector(m,x,y,ns))return ns;}}
+    for(int i=0;i<m->sector_count;i++)if(point_inside_sector(m,x,y,i))return(int16_t)i;
+    return -1;
+}
+static int64_t orient2d(int32_t ax,int32_t ay,int32_t bx,int32_t by,int32_t cx,int32_t cy){return(int64_t)(bx-ax)*(cy-ay)-(int64_t)(by-ay)*(cx-ax);}
+static bool crosses_wall(int32_t x0,int32_t y0,int32_t x1,int32_t y1,const map_wall_t*w){const map_wall_t*e=&g_map.walls[w->point2];int64_t a=orient2d(x0,y0,x1,y1,w->x,w->y),b=orient2d(x0,y0,x1,y1,e->x,e->y),c=orient2d(w->x,w->y,e->x,e->y,x0,y0),d=orient2d(w->x,w->y,e->x,e->y,x1,y1);return((a>0&&b<0)||(a<0&&b>0))&&((c>0&&d<0)||(c<0&&d>0));}
+static bool move_allowed(int32_t x0,int32_t y0,int32_t x1,int32_t y1,int16_t cur,int16_t*newsec){
+    int16_t cand=find_sector(&g_map,x1,y1,cur); if(cand<0)return false; if(cur<0||cur>=g_map.sector_count){*newsec=cand;return true;} const map_sector_t*s=&g_map.sectors[cur];
+    for(int n=0;n<s->wallnum;n++){const map_wall_t*w=&g_map.walls[s->wallptr+n];if(!crosses_wall(x0,y0,x1,y1,w))continue;bool portal=w->nextsector>=0&&(w->cstat&1)==0;if(!portal||cand!=w->nextsector)return false;}*newsec=cand;return true;
+}
+static void try_move_player(int32_t dx,int32_t dy){
+    if(!dx&&!dy)return;
+    int32_t ox=g_player.x,oy=g_player.y,wx=ox+dx,wy=oy+dy;
+    int16_t sec=g_player.sector;
+    if(move_allowed(ox,oy,wx,wy,g_player.sector,&sec)){g_player.x=wx;g_player.y=wy;g_player.sector=sec;}else{if(move_allowed(ox,oy,wx,oy,g_player.sector,&sec)){g_player.x=wx;g_player.sector=sec;}if(move_allowed(g_player.x,oy,g_player.x,wy,g_player.sector,&sec)){g_player.y=wy;g_player.sector=sec;}}
+    if(g_player.sector>=0&&g_player.sector<g_map.sector_count){int32_t eye=g_map.sectors[g_player.sector].floorz-PLAYER_EYE_OFFSET;g_player.z+=(eye-g_player.z)/6;}
+}
+static void reset_player(void){g_player.x=g_map.start_x;g_player.y=g_map.start_y;g_player.z=g_map.start_z;g_player.angle=g_map.start_angle&(BUILD_ANGLE_COUNT-1);g_player.sector=find_sector(&g_map,g_player.x,g_player.y,g_map.start_sector);if(g_player.sector<0)g_player.sector=g_map.start_sector;g_player.health=100;g_player.armor=0;g_player.kills=0;g_player.pickups=0;g_player.sword_timer=0;g_player.damage_flash=0;for(int i=0;i<g_map.sprite_count;i++){g_map.sprites[i].dead=false;g_map.sprites[i].pickup_taken=false;g_map.sprites[i].attack_cooldown=0;if(g_map.sprites[i].picnum==4096||g_map.sprites[i].picnum==4162)g_map.sprites[i].hp=3;else if(g_map.sprites[i].picnum==1400||g_map.sprites[i].picnum==1441)g_map.sprites[i].hp=4;}}
+
+static void camera_basis(float*fx,float*fy,float*rx,float*ry){float a=(float)g_player.angle*BUILD_PI/1024.0f;*fx=cosf(a);*fy=sinf(a);*rx=-*fy;*ry=*fx;}
+static int project_y(int32_t wz,float depth){return(int)(HORIZON+((float)(wz-g_player.z)/16.0f)*FOCAL/depth);}
+
+typedef struct {float x1,z1,x2,z2,t1,t2;} clipped_wall_t;
+static bool project_wall_segment(const map_wall_t*a,const map_wall_t*b,clipped_wall_t*out){
+    float fx,fy,rx,ry;camera_basis(&fx,&fy,&rx,&ry);float dx1=(float)(a->x-g_player.x),dy1=(float)(a->y-g_player.y),dx2=(float)(b->x-g_player.x),dy2=(float)(b->y-g_player.y);
+    float x1=dx1*rx+dy1*ry,z1=dx1*fx+dy1*fy,x2=dx2*rx+dy2*ry,z2=dx2*fx+dy2*fy,t1=0,t2=1;
+    if(z1<=NEAR_PLANE&&z2<=NEAR_PLANE)return false;
+    if(z1<=NEAR_PLANE){float q=(NEAR_PLANE-z1)/(z2-z1);x1+=(x2-x1)*q;t1+=(t2-t1)*q;z1=NEAR_PLANE;}
+    if(z2<=NEAR_PLANE){float q=(NEAR_PLANE-z2)/(z1-z2);x2+=(x1-x2)*q;t2+=(t1-t2)*q;z2=NEAR_PLANE;}
+    out->x1=x1;out->z1=z1;out->x2=x2;out->z2=z2;out->t1=t1;out->t2=t2;return true;
+}
+
+static void render_plane_background(surface_t*s){
+    if(g_player.sector<0||g_player.sector>=g_map.sector_count)return;
+    const map_sector_t*sec=&g_map.sectors[g_player.sector];
+    const texture_t*ceil=find_texture((uint16_t)sec->ceilingpicnum),*floor=find_texture((uint16_t)sec->floorpicnum);
+    float fx,fy,rx,ry;camera_basis(&fx,&fy,&rx,&ry);
+    for(int y=VIEW_TOP;y<VIEW_BOTTOM;y++){
+        bool is_floor=y>HORIZON; if(y==HORIZON)continue;const texture_t*t=is_floor?floor:ceil;int32_t planez=is_floor?sec->floorz:sec->ceilingz;int shade=shade_level(is_floor?sec->floorshade:sec->ceilingshade);int panx=is_floor?sec->floorxpanning:sec->ceilingxpanning,pany=is_floor?sec->floorypanning:sec->ceilingypanning;
+        float denom=(float)(y-HORIZON);float depth=((float)(planez-g_player.z)/16.0f)*FOCAL/denom;if(depth<NEAR_PLANE)depth=NEAR_PLANE;for(int x=0;x<SCREEN_W;x++){float camx=((float)x-160.0f)*depth/FOCAL;float wx=(float)g_player.x+fx*depth+rx*camx,wy=(float)g_player.y+fy*depth+ry*camx;uint8_t idx=t?texel(t,(int)(wx/64.0f)+panx,(int)(wy/64.0f)+pany):0;raw_pixel(s,x,y,g_tex.palette16[shade][idx]);}
+    }
+}
+
+static void draw_textured_span(surface_t*s,const texture_t*t,const map_wall_t*w,float z,float wall_t,int x,int y0,int y1,int full_top,int full_bottom){
+    if(y0>y1){int q=y0;y0=y1;y1=q;}if(y0<VIEW_TOP)y0=VIEW_TOP;if(y1>=VIEW_BOTTOM)y1=VIEW_BOTTOM-1;if(y0>y1)return;int shade=shade_level(w->shade);float repeats=(w->xrepeat?w->xrepeat:8)/8.0f;int u=t?(int)(wall_t*(float)t->w*repeats)+(int)w->xpanning:0;
+    int span=full_bottom-full_top;if(span==0)span=1;for(int y=y0;y<=y1;y++){int v=t?(int)(((float)(y-full_top)/(float)span)*(float)t->h*((w->yrepeat?w->yrepeat:8)/8.0f))+(int)w->ypanning:0;uint8_t idx=t?texel(t,u,v):0;if(idx==255&&((w->cstat&16)!=0))continue;zpixel(s,x,y,z,g_tex.palette16[shade][idx]);}
+}
+
+static bool wall_frustum_visible(const map_wall_t*w){clipped_wall_t c;if(!project_wall_segment(w,&g_map.walls[w->point2],&c))return false;float sx1=160.0f+c.x1*FOCAL/c.z1,sx2=160.0f+c.x2*FOCAL/c.z2;return !(sx1<-48.0f&&sx2<-48.0f)&&!(sx1>368.0f&&sx2>368.0f);}
+
+static int collect_visible_sectors(int16_t start,sector_queue_t*out){
+    memset(g_sector_visible,0,sizeof(g_sector_visible));if(start<0||start>=g_map.sector_count)return 0;int head=0,tail=0;out[tail++]=(sector_queue_t){start,0};g_sector_visible[start]=true;
+    while(head<tail&&tail<MAX_VISIBLE_SECTORS){sector_queue_t q=out[head++];const map_sector_t*s=&g_map.sectors[q.sector];if(q.depth>=MAX_PORTAL_DEPTH)continue;for(int n=0;n<s->wallnum;n++){const map_wall_t*w=&g_map.walls[s->wallptr+n];int ns=w->nextsector;if(ns<0||ns>=g_map.sector_count||(w->cstat&1)||g_sector_visible[ns])continue;if(!wall_frustum_visible(w))continue;g_sector_visible[ns]=true;out[tail++]=(sector_queue_t){(int16_t)ns,(uint8_t)(q.depth+1)};if(tail>=MAX_VISIBLE_SECTORS)break;}}
+    return tail;
+}
+
+static void render_wall(surface_t*s,const map_wall_t*w){
+    const map_wall_t*e=&g_map.walls[w->point2];int owner=w->owner_sector;if(owner<0||owner>=g_map.sector_count)return;clipped_wall_t c;if(!project_wall_segment(w,e,&c))return;float sx1f=160.0f+c.x1*FOCAL/c.z1,sx2f=160.0f+c.x2*FOCAL/c.z2;if((sx1f<0&&sx2f<0)||(sx1f>=SCREEN_W&&sx2f>=SCREEN_W))return;
+    float x1=sx1f,x2=sx2f,z1=c.z1,z2=c.z2,t1=c.t1,t2=c.t2;if(x1>x2){float q=x1;x1=x2;x2=q;q=z1;z1=z2;z2=q;q=t1;t1=t2;t2=q;}int ix1=(int)ceilf(x1),ix2=(int)floorf(x2);if(ix1<0)ix1=0;if(ix2>=SCREEN_W)ix2=SCREEN_W-1;if(ix1>ix2)return;const map_sector_t*sec=&g_map.sectors[owner];const texture_t*tex=find_texture((uint16_t)w->picnum);
+    for(int x=ix1;x<=ix2;x++){float a=(x2!=x1)?((float)x-x1)/(x2-x1):0;float inv=(1-a)/z1+a/z2;if(inv<=0)continue;float z=1.0f/inv;float wt=(((1-a)*t1/z1)+(a*t2/z2))/inv;int ct=project_y(sec->ceilingz,z),fb=project_y(sec->floorz,z);
+        if(w->nextsector>=0&&w->nextsector<g_map.sector_count&&(w->cstat&1)==0){const map_sector_t*ns=&g_map.sectors[w->nextsector];int nct=project_y(ns->ceilingz,z),nfb=project_y(ns->floorz,z);if(ns->ceilingz>sec->ceilingz)draw_textured_span(s,tex,w,z,wt,x,ct,nct,ct,fb);if(ns->floorz<sec->floorz)draw_textured_span(s,tex,w,z,wt,x,nfb,fb,ct,fb);}else draw_textured_span(s,tex,w,z,wt,x,ct,fb,ct,fb);
+    }
+}
+
+static void render_sprite(surface_t*s,const map_sprite_t*sp){
+    if(sp->dead||sp->pickup_taken||(sp->cstat&0x8000)||((sp->cstat>>4)&3)!=0)return;
+    if(sp->sectnum>=0&&sp->sectnum<g_map.sector_count&&!g_sector_visible[sp->sectnum])return;
+    const texture_t*t=find_texture((uint16_t)sp->picnum);
+    if(!t||!t->w||!t->h)return;
+    float fx,fy,rx,ry;camera_basis(&fx,&fy,&rx,&ry);float dx=(float)(sp->x-g_player.x),dy=(float)(sp->y-g_player.y),cx=dx*rx+dy*ry,z=dx*fx+dy*fy;if(z<=NEAR_PLANE)return;float sx=160.0f+cx*FOCAL/z;float worldw=(float)t->w*(float)(sp->xrepeat?sp->xrepeat:32)*0.5f,worldh=(float)t->h*(float)(sp->yrepeat?sp->yrepeat:32)*0.5f;float sw=worldw*FOCAL/z,sh=worldh*FOCAL/z;if(sw<1||sh<1||sw>800||sh>800)return;int left=(int)(sx-sw*0.5f),right=(int)(sx+sw*0.5f),bottom=project_y(sp->z,z),top=bottom-(int)sh;int shade=shade_level(sp->shade);
+    if(left<0)left=0;
+    if(right>=SCREEN_W)right=SCREEN_W-1;
+    if(top<VIEW_TOP)top=VIEW_TOP;
+    if(bottom>=VIEW_BOTTOM)bottom=VIEW_BOTTOM-1;
+    if(left>right||top>bottom)return;
+    for(int x=left;x<=right;x++){int u=(int)(((float)(x-(int)(sx-sw*0.5f))/sw)*t->w);if(sp->cstat&4)u=t->w-1-u;for(int y=top;y<=bottom;y++){int v=(int)(((float)(y-(bottom-(int)sh))/sh)*t->h);if(sp->cstat&8)v=t->h-1-v;uint8_t idx=texel(t,u,v);if(idx==255)continue;zpixel(s,x,y,z,g_tex.palette16[shade][idx]);}}
+}
+
+static void render_world(surface_t*s){
+    for(int i=0;i<SCREEN_W*VIEW_H;i++)g_zbuf[i]=1.0e30f;
+    render_plane_background(s);
+    sector_queue_t q[MAX_VISIBLE_SECTORS];
+    int n=collect_visible_sectors(g_player.sector,q);
+    for(int i=0;i<n;i++){const map_sector_t*sec=&g_map.sectors[q[i].sector];for(int w=0;w<sec->wallnum;w++)render_wall(s,&g_map.walls[sec->wallptr+w]);}
+    for(int i=0;i<g_map.sprite_count;i++)render_sprite(s,&g_map.sprites[i]);
+}
+
+static void render_hud_tile(surface_t*s,int tile_id,int x,int y,int scale,bool flip){const texture_t*t=find_texture((uint16_t)tile_id);if(!t)return;for(int tx=0;tx<t->w;tx++){int sx=flip?t->w-1-tx:tx;for(int ty=0;ty<t->h;ty++){uint8_t idx=texel(t,sx,ty);if(idx==255)continue;uint16_t c=g_tex.palette16[31][idx];for(int yy=0;yy<scale;yy++)for(int xx=0;xx<scale;xx++)raw_pixel(s,x+tx*scale+xx,y+ty*scale+yy,c);}}}
+
+static void render_weapon(surface_t*s){int tile=SWORD_REST;if(g_player.sword_timer>0){if(g_player.sword_timer>8)tile=SWORD_SWING0;else if(g_player.sword_timer>4)tile=SWORD_SWING1;else tile=SWORD_SWING2;}const texture_t*t=find_texture((uint16_t)tile);if(!t)return;int scale=2;if(t->w*3<180&&t->h*3<180)scale=3;int x=SCREEN_W-(int)t->w*scale+18,y=SCREEN_H-(int)t->h*scale+8;render_hud_tile(s,tile,x,y,scale,false);}
+
+static void sword_hit(void){float fx,fy,rx,ry;camera_basis(&fx,&fy,&rx,&ry);int best=-1;float bestz=1600.0f;for(int i=0;i<g_map.sprite_count;i++){map_sprite_t*sp=&g_map.sprites[i];if(sp->dead||sp->hp<=0)continue;float dx=(float)(sp->x-g_player.x),dy=(float)(sp->y-g_player.y),z=dx*fx+dy*fy,side=fabsf(dx*rx+dy*ry);if(z>0&&z<bestz&&side<z*0.45f){best=i;bestz=z;}}if(best>=0){map_sprite_t*sp=&g_map.sprites[best];sp->hp--;if(sp->hp<=0){sp->dead=true;g_player.kills++;}}}
+
+static void update_pickups(void){
+    for(int i=0;i<g_map.sprite_count;i++){
+        map_sprite_t*sp=&g_map.sprites[i];
+        if(sp->pickup_taken||sp->dead)continue;
+        if(sp->picnum!=1802&&sp->picnum!=1803&&sp->picnum!=3030)continue;
+        int64_t dx=(int64_t)sp->x-g_player.x,dy=(int64_t)sp->y-g_player.y;
+        if(dx*dx+dy*dy>=700LL*700LL)continue;
+        if(sp->picnum==3030){
+            if(g_player.armor>=100)continue;
+            g_player.armor=100;
+        }else{
+            if(g_player.health>=100)continue;
+            g_player.health+=(sp->picnum==1802)?20:25;
+            if(g_player.health>100)g_player.health=100;
         }
+        sp->pickup_taken=true;
+        g_player.pickups++;
     }
 }
 
-static int map_to_screen_x(int32_t x) {
-    return ((x - cam_x) >> zoom) + SCREEN_W / 2;
+static void update_enemies(void){if(g_player.health<=0)return;for(int i=0;i<g_map.sprite_count;i++){map_sprite_t*sp=&g_map.sprites[i];if(sp->dead||sp->hp<=0)continue;if(sp->attack_cooldown)sp->attack_cooldown--;int64_t dx64=(int64_t)g_player.x-sp->x,dy64=(int64_t)g_player.y-sp->y;float dist=sqrtf((float)(dx64*dx64+dy64*dy64));if(dist>9000.0f)continue;if(dist<700.0f){if(!sp->attack_cooldown){int damage=4;if(g_player.armor>0){int absorb=damage/2;if(absorb>g_player.armor)absorb=g_player.armor;g_player.armor-=absorb;damage-=absorb;}g_player.health-=damage;if(g_player.health<0)g_player.health=0;g_player.damage_flash=5;sp->attack_cooldown=24;}continue;}float inv=1.0f/(dist>1?dist:1);int32_t nx=sp->x+(int32_t)((float)dx64*inv*28.0f),ny=sp->y+(int32_t)((float)dy64*inv*28.0f);int16_t sec; if(move_allowed(sp->x,sp->y,nx,ny,sp->sectnum,&sec)){sp->x=nx;sp->y=ny;sp->sectnum=sec;}}
 }
 
-static int map_to_screen_y(int32_t y) {
-    return ((y - cam_y) >> zoom) + SCREEN_H / 2;
-}
+static void update_input(void){joypad_poll();joypad_inputs_t in=joypad_get_inputs(JOYPAD_PORT_1);joypad_buttons_t p=joypad_get_buttons_pressed(JOYPAD_PORT_1);if(p.start)reset_player();if(p.a)g_overhead=!g_overhead;if(p.z&&g_player.health>0&&g_player.sword_timer==0){g_player.sword_timer=12;sword_hit();}int turn=in.stick_x;if(in.btn.d_left)turn-=55;if(in.btn.d_right)turn+=55;g_player.angle=(int16_t)((g_player.angle+turn/5)&2047);int forward=in.stick_y;if(in.btn.d_up)forward+=70;if(in.btn.d_down)forward-=70;int strafe=0;if(in.btn.c_left||in.btn.l)strafe-=70;if(in.btn.c_right||in.btn.r)strafe+=70;if(abs(forward)<8)forward=0;if(abs(strafe)<8)strafe=0;int speed=in.btn.b?18:10;float a=(float)g_player.angle*BUILD_PI/1024.0f,fx=cosf(a),fy=sinf(a),rx=-fy,ry=fx;try_move_player((int32_t)((fx*forward+rx*strafe)*speed),(int32_t)((fy*forward+ry*strafe)*speed));if(g_player.sword_timer>0)g_player.sword_timer--;if(g_player.damage_flash>0)g_player.damage_flash--;update_pickups();update_enemies();}
 
-static void render_topdown(surface_t *disp) {
-    uint32_t wall_color = graphics_make_color(210, 210, 210, 255);
-    uint32_t portal_color = graphics_make_color(80, 150, 255, 255);
-    uint32_t player_color = graphics_make_color(255, 60, 60, 255);
-    uint32_t sprite_color = graphics_make_color(255, 220, 80, 255);
+static int outcode(int x,int y){int c=0;if(x<0)c|=1;else if(x>=SCREEN_W)c|=2;if(y<0)c|=4;else if(y>=SCREEN_H)c|=8;return c;}
+static void clipped_line(surface_t*s,int x0,int y0,int x1,int y1,uint32_t color){int c0=outcode(x0,y0),c1=outcode(x1,y1);while(true){if(!(c0|c1)){graphics_draw_line(s,x0,y0,x1,y1,color);return;}if(c0&c1)return;int c=c0?c0:c1,x=0,y=0;if(c&8){if(y1==y0)return;x=x0+(x1-x0)*(SCREEN_H-1-y0)/(y1-y0);y=SCREEN_H-1;}else if(c&4){if(y1==y0)return;x=x0+(x1-x0)*(0-y0)/(y1-y0);y=0;}else if(c&2){if(x1==x0)return;y=y0+(y1-y0)*(SCREEN_W-1-x0)/(x1-x0);x=SCREEN_W-1;}else{if(x1==x0)return;y=y0+(y1-y0)*(0-x0)/(x1-x0);x=0;}if(c==c0){x0=x;y0=y;c0=outcode(x0,y0);}else{x1=x;y1=y;c1=outcode(x1,y1);}}}
+static void render_overhead(surface_t*s,uint32_t solid,uint32_t portal,uint32_t pc){float sx=(g_map.max_x>g_map.min_x)?300.0f/(float)(g_map.max_x-g_map.min_x):1,sy=(g_map.max_y>g_map.min_y)?200.0f/(float)(g_map.max_y-g_map.min_y):1,sc=sx<sy?sx:sy,cx=((float)g_map.min_x+g_map.max_x)*.5f,cy=((float)g_map.min_y+g_map.max_y)*.5f;for(int i=0;i<g_map.wall_count;i++){map_wall_t*a=&g_map.walls[i],*b=&g_map.walls[a->point2];clipped_line(s,(int)(160+(a->x-cx)*sc),(int)(120+(a->y-cy)*sc),(int)(160+(b->x-cx)*sc),(int)(120+(b->y-cy)*sc),a->nextsector>=0?portal:solid);}int px=(int)(160+(g_player.x-cx)*sc),py=(int)(120+(g_player.y-cy)*sc);graphics_draw_box(s,px-2,py-2,5,5,pc);}
 
-    for (uint32_t i = 0; i < g_hdr->num_walls; i++) {
-        const s64_wall_t *w = &g_walls[i];
-        if (w->point2 < 0 || w->point2 >= g_hdr->num_walls) continue;
-        const s64_wall_t *w2 = &g_walls[w->point2];
-        int x1 = map_to_screen_x(w->x);
-        int y1 = map_to_screen_y(w->y);
-        int x2 = map_to_screen_x(w2->x);
-        int y2 = map_to_screen_y(w2->y);
-        graphics_draw_line(disp, x1, y1, x2, y2, w->nextsector >= 0 ? portal_color : wall_color);
-    }
+static void render_frame(void){surface_t*s=display_get();uint16_t black=pack_rgb16(0,0,0),white=pack_rgb16(30,30,30),green=pack_rgb16(5,31,10),blue=pack_rgb16(5,12,31),red=pack_rgb16(31,3,3);graphics_fill_screen(s,black);if(g_map.walls&&g_tex.blob){if(g_overhead)render_overhead(s,white,blue,green);else{render_world(s);render_weapon(s);}}if(g_player.damage_flash){for(int y=0;y<SCREEN_H;y+=8)for(int x=0;x<SCREEN_W;x+=8)raw_pixel(s,x,y,red);}graphics_set_color(g_map.walls&&g_tex.blob?green:red,black);graphics_draw_text(s,8,8,"SHADOW64 R12 TEXTURED PLAYABLE");graphics_set_color(white,black);char line[128];snprintf(line,sizeof(line),"%.72s HP:%d AR:%d K:%d P:%d",g_status,g_player.health,g_player.armor,g_player.kills,g_player.pickups);graphics_draw_text(s,8,20,line);snprintf(line,sizeof(line),"SEC:%d ANG:%d  Z:SWORD A:MAP B:RUN",g_player.sector,g_player.angle);graphics_draw_text(s,8,228,line);if(g_player.health<=0)graphics_draw_text(s,116,112,"YOU DIED - START");display_show(s);g_frame++;}
 
-    for (uint32_t i = 0; i < g_hdr->num_sprites; i++) {
-        int x = map_to_screen_x(g_sprites[i].x);
-        int y = map_to_screen_y(g_sprites[i].y);
-        graphics_draw_box(disp, x - 1, y - 1, 3, 3, sprite_color);
-    }
-
-    int px = map_to_screen_x(cam_x);
-    int py = map_to_screen_y(cam_y);
-    graphics_draw_box(disp, px - 2, py - 2, 5, 5, player_color);
-
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-    int dx = (cs * 28) >> 10;
-    int dy = (sn * 28) >> 10;
-    graphics_draw_line(disp, px, py, px + dx, py + dy, player_color);
-}
-
-static int cmp_render_wall(const void *a, const void *b) {
-    const render_wall_t *wa = (const render_wall_t*)a;
-    const render_wall_t *wb = (const render_wall_t*)b;
-    return wb->zavg - wa->zavg; /* far to near */
-}
-
-static void add_projected_wall(render_wall_t *list, int *count, const s64_sector_t *s, const s64_wall_t *w) {
-    if (*count >= MAX_RENDER_WALLS) return;
-    if (w->point2 < 0 || w->point2 >= g_hdr->num_walls) return;
-
-    const s64_wall_t *w2 = &g_walls[w->point2];
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-
-    int32_t dx1 = w->x - cam_x;
-    int32_t dy1 = w->y - cam_y;
-    int32_t dx2 = w2->x - cam_x;
-    int32_t dy2 = w2->y - cam_y;
-
-    int32_t x1 = ((int64_t)-dx1 * sn + (int64_t)dy1 * cs) >> 10;
-    int32_t z1 = ((int64_t) dx1 * cs + (int64_t)dy1 * sn) >> 10;
-    int32_t x2 = ((int64_t)-dx2 * sn + (int64_t)dy2 * cs) >> 10;
-    int32_t z2 = ((int64_t) dx2 * cs + (int64_t)dy2 * sn) >> 10;
-
-    if (z1 <= NEAR_Z && z2 <= NEAR_Z) return;
-    if (z1 > FAR_Z && z2 > FAR_Z) return;
-
-    if (z1 < NEAR_Z) {
-        int32_t dz = z2 - z1;
-        if (dz == 0) return;
-        int64_t num = NEAR_Z - z1;
-        x1 = x1 + (int32_t)(((int64_t)(x2 - x1) * num) / dz);
-        z1 = NEAR_Z;
-    }
-    if (z2 < NEAR_Z) {
-        int32_t dz = z1 - z2;
-        if (dz == 0) return;
-        int64_t num = NEAR_Z - z2;
-        x2 = x2 + (int32_t)(((int64_t)(x1 - x2) * num) / dz);
-        z2 = NEAR_Z;
-    }
-
-    int sx1 = SCREEN_W / 2 + (int)(((int64_t)x1 * FOCAL) / z1);
-    int sx2 = SCREEN_W / 2 + (int)(((int64_t)x2 * FOCAL) / z2);
-    if (sx1 == sx2) return;
-    if ((sx1 < 0 && sx2 < 0) || (sx1 >= SCREEN_W && sx2 >= SCREEN_W)) return;
-
-    int32_t cz = s->ceilingz - cam_z;
-    int32_t fz = s->floorz - cam_z;
-    int yceil1 = HORIZON + (int)((((int64_t)cz >> 8) * FOCAL) / z1);
-    int yfloor1 = HORIZON + (int)((((int64_t)fz >> 8) * FOCAL) / z1);
-    int yceil2 = HORIZON + (int)((((int64_t)cz >> 8) * FOCAL) / z2);
-    int yfloor2 = HORIZON + (int)((((int64_t)fz >> 8) * FOCAL) / z2);
-
-    render_wall_t *rw = &list[*count];
-    rw->sx1 = sx1;
-    rw->sx2 = sx2;
-    rw->yceil1 = yceil1;
-    rw->yceil2 = yceil2;
-    rw->yfloor1 = yfloor1;
-    rw->yfloor2 = yfloor2;
-    rw->zavg = (z1 + z2) >> 1;
-    rw->picnum = (uint16_t)w->picnum;
-    rw->pal = w->pal;
-    rw->portal = w->nextsector >= 0 ? 1 : 0;
-    (*count)++;
-}
-
-static void draw_projected_wall(surface_t *disp, const render_wall_t *rw) {
-    int sx1 = rw->sx1;
-    int sx2 = rw->sx2;
-    int yc1 = rw->yceil1;
-    int yc2 = rw->yceil2;
-    int yf1 = rw->yfloor1;
-    int yf2 = rw->yfloor2;
-    int flip = 0;
-
-    if (sx1 > sx2) {
-        int t;
-        t = sx1; sx1 = sx2; sx2 = t;
-        t = yc1; yc1 = yc2; yc2 = t;
-        t = yf1; yf1 = yf2; yf2 = t;
-        flip = 1;
-    }
-
-    int width = sx2 - sx1;
-    if (width <= 0) return;
-
-    const s64_tile_t *tile = find_tile(rw->picnum);
-    uint32_t fallback = graphics_make_color(80 + (rw->picnum & 63), 80 + ((rw->picnum >> 2) & 63), 100 + ((rw->picnum >> 4) & 95), 255);
-    if (rw->portal) fallback = graphics_make_color(35, 70, 110, 255);
-
-    int startx = sx1 < 0 ? 0 : sx1;
-    int endx = sx2 >= SCREEN_W ? SCREEN_W - 1 : sx2;
-
-    for (int x = startx; x <= endx; x++) {
-        int local = x - sx1;
-        int yceil = yc1 + (int)(((int64_t)(yc2 - yc1) * local) / width);
-        int yfloor = yf1 + (int)(((int64_t)(yf2 - yf1) * local) / width);
-        if (yceil > yfloor) {
-            int tmp = yceil; yceil = yfloor; yfloor = tmp;
-        }
-        if (yfloor < 0 || yceil >= SCREEN_H) continue;
-        int draw_y0 = yceil < 0 ? 0 : yceil;
-        int draw_y1 = yfloor >= SCREEN_H ? SCREEN_H - 1 : yfloor;
-        int wall_h = yfloor - yceil;
-        if (wall_h <= 0) continue;
-
-        int u;
-        if (tile) {
-            u = ((int64_t)local * tile->w) / width;
-            if (flip) u = tile->w - 1 - u;
-        } else {
-            u = 0;
-        }
-
-        for (int y = draw_y0; y <= draw_y1; y++) {
-            uint32_t color = fallback;
-            if (tile) {
-                int v = ((int64_t)(y - yceil) * tile->h) / wall_h;
-                uint8_t idx = tile_sample(tile, u, v);
-                color = g_pal_rgba[idx];
-                if (rw->portal) {
-                    /* Cheap darkening so pass-through walls read as debug portals. */
-                    if (((x ^ y) & 3) == 0) color = graphics_make_color(30, 70, 120, 255);
-                }
-            }
-            graphics_draw_pixel(disp, x, y, color);
-        }
-    }
-}
-
-static void render_first_person(surface_t *disp) {
-    uint32_t sky = graphics_make_color(20, 24, 34, 255);
-    uint32_t ground = graphics_make_color(30, 26, 20, 255);
-    graphics_draw_box(disp, 0, 0, SCREEN_W, HORIZON, sky);
-    graphics_draw_box(disp, 0, HORIZON, SCREEN_W, SCREEN_H - HORIZON, ground);
-
-    render_wall_t list[MAX_RENDER_WALLS];
-    int count = 0;
-    for (uint32_t si = 0; si < g_hdr->num_sectors; si++) {
-        const s64_sector_t *s = &g_sectors[si];
-        int start = s->wallptr;
-        int end = s->wallptr + s->wallnum;
-        if (start < 0 || end > g_hdr->num_walls) continue;
-        for (int wi = start; wi < end; wi++) {
-            add_projected_wall(list, &count, s, &g_walls[wi]);
-        }
-    }
-
-    qsort(list, count, sizeof(list[0]), cmp_render_wall);
-    for (int i = 0; i < count; i++) {
-        draw_projected_wall(disp, &list[i]);
-    }
-    g_last_render_walls = count;
-
-    uint32_t cross = graphics_make_color(255, 255, 255, 255);
-    graphics_draw_line(disp, SCREEN_W / 2 - 4, SCREEN_H / 2, SCREEN_W / 2 + 4, SCREEN_H / 2, cross);
-    graphics_draw_line(disp, SCREEN_W / 2, SCREEN_H / 2 - 4, SCREEN_W / 2, SCREEN_H / 2 + 4, cross);
-}
-
-static void render_debug(surface_t *disp) {
-    char line[128];
-    graphics_draw_text(disp, 8, 8, "Shadow64 Phase 0 R11 SOFTWARE / $DMWOODS.MAP");
-    snprintf(line, sizeof(line), "view:%s sectors:%u walls:%u sprites:%lu tiles:%lu",
-        view_mode == 0 ? "first-person" : "top-down",
-        g_hdr->num_sectors, g_hdr->num_walls,
-        (unsigned long)g_hdr->num_sprites, (unsigned long)g_hdr->tile_count);
-    graphics_draw_text(disp, 8, 20, line);
-
-    snprintf(line, sizeof(line), "x:%ld y:%ld z:%ld ang:%u drawn:%d",
-        (long)cam_x, (long)cam_y, (long)cam_z, cam_ang, g_last_render_walls);
-    graphics_draw_text(disp, 8, 32, line);
-    graphics_draw_text(disp, 8, 44, "renderer: software CPU columns / libdragon trunk / GL disabled");
-
-    if (show_help) {
-        graphics_draw_text(disp, 8, 204, "Dpad up/down move  Dpad left/right strafe");
-        graphics_draw_text(disp, 8, 216, "C-left/C-right turn  A reset  B switch view");
-        graphics_draw_text(disp, 8, 228, "R11 = CPU software renderer only; no OpenGL/preview path");
-    }
-}
-
-static void load_bank(void) {
-    dfs_init(DFS_DEFAULT_LOCATION);
-
-    int fp = dfs_open(BANK_PATH);
-    if (fp < 0) return;
-
-    int size = dfs_size(fp);
-    g_bank = malloc(size);
-    if (!g_bank) {
-        dfs_close(fp);
-        return;
-    }
-    dfs_read(g_bank, 1, size, fp);
-    dfs_close(fp);
-
-    g_hdr = (const s64_bank_header_t*)g_bank;
-    if (memcmp(g_hdr->magic, "S64B", 4) != 0 || g_hdr->version != 1) {
-        free(g_bank);
-        g_bank = NULL;
-        g_hdr = NULL;
-        return;
-    }
-
-    g_palette = g_bank + g_hdr->palette_offset;
-    g_sectors = (const s64_sector_t*)(g_bank + g_hdr->map_offset);
-    g_walls = (const s64_wall_t*)((const uint8_t*)g_sectors + g_hdr->num_sectors * sizeof(s64_sector_t));
-    g_sprites = (const s64_sprite_t*)((const uint8_t*)g_walls + g_hdr->num_walls * sizeof(s64_wall_t));
-    g_tiles = (const s64_tile_t*)(g_bank + g_hdr->tile_dir_offset);
-    g_tile_pixels = g_bank + g_hdr->tile_data_offset;
-    rebuild_palette_cache();
-
-    cam_x = g_hdr->start_x;
-    cam_y = g_hdr->start_y;
-    cam_z = g_hdr->start_z;
-    cam_ang = g_hdr->start_ang;
-}
-
-static void reset_camera(void) {
-    if (!g_hdr) return;
-    cam_x = g_hdr->start_x;
-    cam_y = g_hdr->start_y;
-    cam_z = g_hdr->start_z;
-    cam_ang = g_hdr->start_ang;
-    zoom = 6;
-}
-
-static void update_controls(void) {
-    struct controller_data held = get_keys_held();
-    struct controller_data down = get_keys_down();
-
-    if (!g_hdr) return;
-
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-    int speed = 96;
-    if (held.c[0].up) {
-        cam_x += ((int32_t)cs * speed) >> 10;
-        cam_y += ((int32_t)sn * speed) >> 10;
-    }
-    if (held.c[0].down) {
-        cam_x -= ((int32_t)cs * speed) >> 10;
-        cam_y -= ((int32_t)sn * speed) >> 10;
-    }
-    if (held.c[0].left) {
-        cam_x += ((int32_t)sn * speed) >> 10;
-        cam_y -= ((int32_t)cs * speed) >> 10;
-    }
-    if (held.c[0].right) {
-        cam_x -= ((int32_t)sn * speed) >> 10;
-        cam_y += ((int32_t)cs * speed) >> 10;
-    }
-    if (held.c[0].C_left) cam_ang -= 12;
-    if (held.c[0].C_right) cam_ang += 12;
-    if (held.c[0].C_up && view_mode == 1 && zoom > 2) zoom--;
-    if (held.c[0].C_down && view_mode == 1 && zoom < 12) zoom++;
-
-    if (down.c[0].A) reset_camera();
-    if (down.c[0].B) view_mode = !view_mode;
-}
-
-int main(void) {
-    display_init(RESOLUTION_320x240, DEPTH_16_BPP, 2, GAMMA_NONE, FILTERS_RESAMPLE);
-    controller_init();
-
-    bool expanded = get_memory_size() >= 8 * 1024 * 1024;
-    load_bank();
-
-    while (1) {
-        controller_scan();
-        update_controls();
-
-        surface_t *disp = display_get();
-        graphics_fill_screen(disp, graphics_make_color(0, 0, 0, 255));
-
-        if (!expanded) {
-            graphics_draw_text(disp, 40, 100, "Expansion Pak required.");
-            graphics_draw_text(disp, 40, 116, "Shadow64 is 8MB-only.");
-        } else if (!g_hdr) {
-            graphics_draw_text(disp, 24, 100, "Could not load /dmwoods.s64b from DFS.");
-            graphics_draw_text(disp, 24, 116, "Check Makefile/DFS asset packing.");
-        } else {
-            if (view_mode == 0) {
-                render_first_person(disp);
-            } else {
-                render_topdown(disp);
-                draw_tile_preview(disp, 248, 48, g_tiles[0].picnum, 1);
-            }
-            render_debug(disp);
-        }
-
-        display_show(disp);
-    }
-
-    return 0;
-}
+int main(void){debug_init_isviewer();debug_init_usblog();display_init(RESOLUTION_320x240,DEPTH_16_BPP,3,GAMMA_NONE,FILTERS_RESAMPLE);joypad_init();int dr=dfs_init(DFS_DEFAULT_LOCATION);if(dr!=DFS_ESUCCESS)snprintf(g_status,sizeof(g_status),"DFS ERROR: %s",dfs_strerror(dr));else if(load_map(MAP_PATH,&g_map)&&load_texture_bank(TEX_PATH,&g_tex))reset_player();while(true){if(g_map.walls&&g_tex.blob)update_input();render_frame();}return 0;}

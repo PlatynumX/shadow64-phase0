@@ -1,0 +1,3 @@
+Replaced source: src/main.c
+Map: $bullet.map
+Texture bank: filesystem/sw_r12_tex.bin
