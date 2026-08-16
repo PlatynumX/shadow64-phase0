@@ -15,7 +15,7 @@ DFS_FILES = $(wildcard $(FILESYSTEM_DIR)/*)
 $(PROJECT).z64: N64_ROM_TITLE="Shadow64 P0 R11"
 $(PROJECT).z64: $(BUILD_DIR)/$(PROJECT).dfs
 
-$(BUILD_DIR)/$(PROJECT).dfs: $(DFS_FILES)
+$(BUILD_DIR)/$(PROJECT).dfs: $(DFS_FILES) filesystem/sw_first.map filesystem/sw_r13_tex.bin
 
 $(BUILD_DIR)/$(PROJECT).elf: $(OBJS)
 
@@ -24,3 +24,5 @@ clean:
 .PHONY: clean
 
 -include $(wildcard $(BUILD_DIR)/*.d)
+
+# Shadow64 R13 Duke64 Gameplay: user-derived map and compact ART texture bank are packed into DragonFS.
