@@ -1,548 +1,566 @@
 #include <libdragon.h>
+
+#include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <stdbool.h>
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define BANK_PATH "/dmwoods.s64b"
-#define NEAR_Z 128
-#define FAR_Z 65536
-#define FOCAL 192
-#define HORIZON 108
-#define MAX_RENDER_WALLS 512
-#define SHADOW64_SOFTWARE_RENDERER_ONLY 1
+#define BUILD_ANGLE_COUNT 2048
+#define BUILD_PI 3.14159265358979323846f
+#define MAP_PATH "rom:/sw_first.map"
+#define NEAR_PLANE 64.0f
+#define PLAYER_EYE_OFFSET (40 * 256)
 
-/*
- * R11 deliberately stays on the CPU/software renderer path. No libdragon
- * preview branch, no OpenGL, no RDP triangle path. This keeps the baseline
- * close to Build/JFBuild: project walls, draw vertical columns, sample ART
- * tiles in their native column-major layout, and keep top-down debugging.
- */
+typedef struct {
+    int16_t wallptr;
+    int16_t wallnum;
+    int32_t ceilingz;
+    int32_t floorz;
+} map_sector_t;
 
-typedef struct __attribute__((packed)) {
-    char magic[4];
-    uint16_t version;
-    uint16_t flags;
-    uint32_t palette_offset;
-    uint32_t palette_size;
-    uint32_t map_offset;
-    uint32_t map_size;
-    uint32_t tile_dir_offset;
-    uint32_t tile_count;
-    uint32_t tile_data_offset;
-    uint32_t tile_data_size;
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int16_t point2;
+    int16_t nextwall;
+    int16_t nextsector;
+    int16_t cstat;
+    int16_t owner_sector;
+} map_wall_t;
+
+typedef struct {
+    int version;
     int32_t start_x;
     int32_t start_y;
     int32_t start_z;
-    int32_t start_reserved;
-    uint16_t start_ang;
-    uint16_t start_sector;
-    uint16_t num_sectors;
-    uint16_t num_walls;
-    uint32_t num_sprites;
-    uint32_t sector_size;
-    uint32_t wall_size;
-    uint32_t sprite_size;
-    uint32_t tile_entry_size;
-    uint32_t map_crc32;
-    uint32_t tile_crc32;
-    uint32_t reserved0;
-    uint8_t reserved1[32];
-} s64_bank_header_t;
-
-typedef struct __attribute__((packed)) {
-    int16_t wallptr, wallnum;
-    int32_t ceilingz, floorz;
-    uint16_t ceilingstat, floorstat;
-    int16_t ceilingpicnum, ceilingheinum;
-    int8_t ceilingshade;
-    uint8_t ceilingpal, ceilingxpanning, ceilingypanning;
-    int16_t floorpicnum, floorheinum;
-    int8_t floorshade;
-    uint8_t floorpal, floorxpanning, floorypanning;
-    uint8_t visibility, filler;
-    int16_t lotag, hitag, extra;
-} s64_sector_t;
-
-typedef struct __attribute__((packed)) {
-    int32_t x, y;
-    int16_t point2, nextwall, nextsector, cstat, picnum, overpicnum;
-    int8_t shade;
-    uint8_t pal, xrepeat, yrepeat, xpanning, ypanning;
-    int16_t lotag, hitag, extra;
-} s64_wall_t;
-
-typedef struct __attribute__((packed)) {
-    int32_t x, y, z;
-    int16_t cstat, picnum;
-    int8_t shade;
-    uint8_t pal, clipdist, filler, xrepeat, yrepeat;
-    int8_t xoffset, yoffset;
-    int16_t sectnum, statnum, ang, owner, xvel, yvel, zvel, lotag, hitag, extra;
-} s64_sprite_t;
-
-typedef struct __attribute__((packed)) {
-    uint16_t picnum;
-    uint16_t w;
-    uint16_t h;
-    uint16_t reserved;
-    uint32_t data_offset;
-    uint32_t data_size;
-    uint32_t picanm;
-} s64_tile_t;
+    int16_t start_angle;
+    int16_t start_sector;
+    int16_t sector_count;
+    int16_t wall_count;
+    int16_t sprite_count;
+    map_sector_t *sectors;
+    map_wall_t *walls;
+    int32_t min_x;
+    int32_t min_y;
+    int32_t max_x;
+    int32_t max_y;
+} map_data_t;
 
 typedef struct {
-    int sx1, sx2;
-    int yceil1, yceil2;
-    int yfloor1, yfloor2;
-    int zavg;
-    uint16_t picnum;
-    uint8_t pal;
-    uint8_t portal;
-} render_wall_t;
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    int16_t angle;
+    int16_t sector;
+} player_t;
 
-_Static_assert(sizeof(s64_bank_header_t) == 128, "bad bank header size");
-_Static_assert(sizeof(s64_sector_t) == 40, "bad sector size");
-_Static_assert(sizeof(s64_wall_t) == 32, "bad wall size");
-_Static_assert(sizeof(s64_sprite_t) == 44, "bad sprite size");
-_Static_assert(sizeof(s64_tile_t) == 20, "bad tile entry size");
+static map_data_t g_map;
+static player_t g_player;
+static bool g_overhead = false;
+static char g_status[160] = "boot";
 
-static uint8_t *g_bank;
-static const s64_bank_header_t *g_hdr;
-static const uint8_t *g_palette;
-static const s64_sector_t *g_sectors;
-static const s64_wall_t *g_walls;
-static const s64_sprite_t *g_sprites;
-static const s64_tile_t *g_tiles;
-static const uint8_t *g_tile_pixels;
-static uint32_t g_pal_rgba[256];
-
-static int32_t cam_x, cam_y, cam_z;
-static uint16_t cam_ang;
-static int zoom = 6;
-static int view_mode = 0; /* 0 = first person, 1 = map */
-static int show_help = 1;
-static int g_last_render_walls = 0;
-
-/* 0..90 degree sine, 33 samples, scaled by 1024. */
-static const int16_t sin_quarter_1024[33] = {
-    0, 50, 100, 150, 200, 249, 297, 345, 392, 438, 483, 526, 569, 610, 650, 688,
-    724, 759, 792, 822, 851, 878, 903, 926, 946, 964, 980, 993, 1004, 1013, 1019, 1023, 1024
-};
-
-static int16_t isin1024(uint16_t angle) {
-    uint16_t a = angle & 2047;
-    int sign = 1;
-    if (a >= 1024) { a -= 1024; sign = -1; }
-    if (a > 512) a = 1024 - a;
-    int idx = a >> 4;
-    if (idx >= 32) return sign * 1024;
-    int frac = a & 15;
-    int v0 = sin_quarter_1024[idx];
-    int v1 = sin_quarter_1024[idx + 1];
-    return (int16_t)(sign * (v0 + ((v1 - v0) * frac >> 4)));
+static int16_t le_i16(const uint8_t *p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-static int16_t icos1024(uint16_t angle) {
-    return isin1024(angle + 512);
+static int32_t le_i32(const uint8_t *p) {
+    return (int32_t)((uint32_t)p[0] |
+                     ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) |
+                     ((uint32_t)p[3] << 24));
 }
 
-static uint32_t make_pal_color(uint8_t idx) {
-    const uint8_t *p = &g_palette[idx * 3];
-    int r = p[0], g = p[1], b = p[2];
-    if (r <= 63 && g <= 63 && b <= 63) {
-        r <<= 2; g <<= 2; b <<= 2;
+static bool read_exact(FILE *fp, void *dst, size_t size) {
+    return fread(dst, 1, size, fp) == size;
+}
+
+static bool read_i16(FILE *fp, int16_t *out) {
+    uint8_t raw[2];
+    if (!read_exact(fp, raw, sizeof(raw))) return false;
+    *out = le_i16(raw);
+    return true;
+}
+
+static bool read_i32(FILE *fp, int32_t *out) {
+    uint8_t raw[4];
+    if (!read_exact(fp, raw, sizeof(raw))) return false;
+    *out = le_i32(raw);
+    return true;
+}
+
+static void free_map(map_data_t *map) {
+    free(map->sectors);
+    free(map->walls);
+    memset(map, 0, sizeof(*map));
+}
+
+static bool fail_load(FILE *fp, map_data_t *map, const char *reason) {
+    if (fp) fclose(fp);
+    free_map(map);
+    snprintf(g_status, sizeof(g_status), "MAP ERROR: %s", reason);
+    debugf("Shadow64 R11B: %s\n", g_status);
+    return false;
+}
+
+static bool load_map(const char *path, map_data_t *map) {
+    uint8_t sector_raw[40];
+    uint8_t wall_raw[32];
+    FILE *fp = NULL;
+    int32_t version = 0;
+    int16_t count = 0;
+
+    free_map(map);
+    fp = fopen(path, "rb");
+    if (!fp) return fail_load(NULL, map, "rom:/sw_first.map not found");
+
+    if (!read_i32(fp, &version)) return fail_load(fp, map, "short version header");
+    if (version != 7 && version != 8) return fail_load(fp, map, "only Build v7/v8 maps supported");
+    map->version = version;
+
+    if (!read_i32(fp, &map->start_x) ||
+        !read_i32(fp, &map->start_y) ||
+        !read_i32(fp, &map->start_z) ||
+        !read_i16(fp, &map->start_angle) ||
+        !read_i16(fp, &map->start_sector)) {
+        return fail_load(fp, map, "short player start header");
     }
-    return graphics_make_color(r, g, b, 255);
-}
 
-static void rebuild_palette_cache(void) {
-    for (int i = 0; i < 256; i++) {
-        g_pal_rgba[i] = make_pal_color((uint8_t)i);
+    if (!read_i16(fp, &count)) return fail_load(fp, map, "missing sector count");
+    if (count <= 0 || count > (version == 7 ? 1024 : 4096)) {
+        return fail_load(fp, map, "invalid sector count");
     }
-}
+    map->sector_count = count;
+    map->sectors = calloc((size_t)count, sizeof(*map->sectors));
+    if (!map->sectors) return fail_load(fp, map, "sector allocation failed");
 
-static const s64_tile_t *find_tile(uint16_t picnum) {
-    for (uint32_t i = 0; i < g_hdr->tile_count; i++) {
-        if (g_tiles[i].picnum == picnum) return &g_tiles[i];
+    for (int i = 0; i < map->sector_count; ++i) {
+        if (!read_exact(fp, sector_raw, sizeof(sector_raw))) {
+            return fail_load(fp, map, "short sector table");
+        }
+        map->sectors[i].wallptr = le_i16(&sector_raw[0]);
+        map->sectors[i].wallnum = le_i16(&sector_raw[2]);
+        map->sectors[i].ceilingz = le_i32(&sector_raw[4]);
+        map->sectors[i].floorz = le_i32(&sector_raw[8]);
     }
-    return NULL;
+
+    if (!read_i16(fp, &count)) return fail_load(fp, map, "missing wall count");
+    if (count <= 0 || count > (version == 7 ? 8192 : 16384)) {
+        return fail_load(fp, map, "invalid wall count");
+    }
+    map->wall_count = count;
+    map->walls = calloc((size_t)count, sizeof(*map->walls));
+    if (!map->walls) return fail_load(fp, map, "wall allocation failed");
+
+    map->min_x = INT32_MAX;
+    map->min_y = INT32_MAX;
+    map->max_x = INT32_MIN;
+    map->max_y = INT32_MIN;
+
+    for (int i = 0; i < map->wall_count; ++i) {
+        map_wall_t *wall = &map->walls[i];
+        if (!read_exact(fp, wall_raw, sizeof(wall_raw))) {
+            return fail_load(fp, map, "short wall table");
+        }
+        wall->x = le_i32(&wall_raw[0]);
+        wall->y = le_i32(&wall_raw[4]);
+        wall->point2 = le_i16(&wall_raw[8]);
+        wall->nextwall = le_i16(&wall_raw[10]);
+        wall->nextsector = le_i16(&wall_raw[12]);
+        wall->cstat = le_i16(&wall_raw[14]);
+        wall->owner_sector = -1;
+
+        if (wall->x < map->min_x) map->min_x = wall->x;
+        if (wall->x > map->max_x) map->max_x = wall->x;
+        if (wall->y < map->min_y) map->min_y = wall->y;
+        if (wall->y > map->max_y) map->max_y = wall->y;
+    }
+
+    if (!read_i16(fp, &map->sprite_count)) {
+        return fail_load(fp, map, "missing sprite count");
+    }
+    if (map->sprite_count < 0 || map->sprite_count > (version == 7 ? 4096 : 16384)) {
+        return fail_load(fp, map, "invalid sprite count");
+    }
+
+    for (int sector_index = 0; sector_index < map->sector_count; ++sector_index) {
+        const map_sector_t *sector = &map->sectors[sector_index];
+        const int first = sector->wallptr;
+        const int end = first + sector->wallnum;
+        if (first < 0 || sector->wallnum < 0 || end > map->wall_count) {
+            return fail_load(fp, map, "sector wall range outside wall table");
+        }
+        for (int wall_index = first; wall_index < end; ++wall_index) {
+            map->walls[wall_index].owner_sector = (int16_t)sector_index;
+        }
+    }
+
+    for (int i = 0; i < map->wall_count; ++i) {
+        if (map->walls[i].point2 < 0 || map->walls[i].point2 >= map->wall_count) {
+            return fail_load(fp, map, "wall point2 outside wall table");
+        }
+    }
+
+    fclose(fp);
+    snprintf(g_status, sizeof(g_status), "v%d  sec:%d wall:%d spr:%d",
+             map->version, map->sector_count, map->wall_count, map->sprite_count);
+    debugf("Shadow64 R11B loaded %s (%s)\n", path, g_status);
+    return true;
 }
 
-static uint8_t tile_sample(const s64_tile_t *t, int x, int y) {
-    if (!t || !t->w || !t->h) return 0;
-    x %= t->w; if (x < 0) x += t->w;
-    y %= t->h; if (y < 0) y += t->h;
-    const uint8_t *pix = g_tile_pixels + t->data_offset;
-    /* Build ART tiles are column-major: offset = x * height + y. */
-    return pix[x * t->h + y];
+static bool point_inside_sector(const map_data_t *map, int32_t x, int32_t y, int sector_index) {
+    if (sector_index < 0 || sector_index >= map->sector_count) return false;
+    const map_sector_t *sector = &map->sectors[sector_index];
+    bool inside = false;
+
+    for (int n = 0; n < sector->wallnum; ++n) {
+        const int wall_index = sector->wallptr + n;
+        const map_wall_t *a = &map->walls[wall_index];
+        const map_wall_t *b = &map->walls[a->point2];
+        const bool crosses = ((a->y > y) != (b->y > y));
+        if (crosses) {
+            const double intersect_x = (double)(b->x - a->x) * (double)(y - a->y) /
+                                       (double)(b->y - a->y) + (double)a->x;
+            if ((double)x < intersect_x) inside = !inside;
+        }
+    }
+    return inside;
 }
 
-static void draw_tile_preview(surface_t *disp, int x0, int y0, uint16_t picnum, int scale) {
-    const s64_tile_t *t = find_tile(picnum);
-    if (!t) return;
+static int16_t find_sector(const map_data_t *map, int32_t x, int32_t y, int16_t hint) {
+    if (point_inside_sector(map, x, y, hint)) return hint;
 
-    int tw = t->w;
-    int th = t->h;
-    if (tw > 64) tw = 64;
-    if (th > 64) th = 64;
-
-    for (int y = 0; y < th; y++) {
-        for (int x = 0; x < tw; x++) {
-            uint8_t idx = tile_sample(t, x, y);
-            uint32_t c = g_pal_rgba[idx];
-            for (int yy = 0; yy < scale; yy++) {
-                for (int xx = 0; xx < scale; xx++) {
-                    int sx = x0 + x * scale + xx;
-                    int sy = y0 + y * scale + yy;
-                    if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H) {
-                        graphics_draw_pixel(disp, sx, sy, c);
-                    }
-                }
+    if (hint >= 0 && hint < map->sector_count) {
+        const map_sector_t *sector = &map->sectors[hint];
+        for (int n = 0; n < sector->wallnum; ++n) {
+            const map_wall_t *wall = &map->walls[sector->wallptr + n];
+            if (wall->nextsector >= 0 && point_inside_sector(map, x, y, wall->nextsector)) {
+                return wall->nextsector;
             }
         }
     }
+
+    for (int i = 0; i < map->sector_count; ++i) {
+        if (point_inside_sector(map, x, y, i)) return (int16_t)i;
+    }
+    return -1;
 }
 
-static int map_to_screen_x(int32_t x) {
-    return ((x - cam_x) >> zoom) + SCREEN_W / 2;
+static void reset_player(void) {
+    g_player.x = g_map.start_x;
+    g_player.y = g_map.start_y;
+    g_player.z = g_map.start_z;
+    g_player.angle = (int16_t)(g_map.start_angle & (BUILD_ANGLE_COUNT - 1));
+    g_player.sector = find_sector(&g_map, g_player.x, g_player.y, g_map.start_sector);
+    if (g_player.sector < 0) g_player.sector = g_map.start_sector;
 }
 
-static int map_to_screen_y(int32_t y) {
-    return ((y - cam_y) >> zoom) + SCREEN_H / 2;
+static int64_t orient2d(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t cx, int32_t cy) {
+    return (int64_t)(bx - ax) * (int64_t)(cy - ay) -
+           (int64_t)(by - ay) * (int64_t)(cx - ax);
 }
 
-static void render_topdown(surface_t *disp) {
-    uint32_t wall_color = graphics_make_color(210, 210, 210, 255);
-    uint32_t portal_color = graphics_make_color(80, 150, 255, 255);
-    uint32_t player_color = graphics_make_color(255, 60, 60, 255);
-    uint32_t sprite_color = graphics_make_color(255, 220, 80, 255);
+static bool movement_crosses_wall(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                                  const map_wall_t *wall) {
+    const map_wall_t *end = &g_map.walls[wall->point2];
+    const int64_t a = orient2d(x0, y0, x1, y1, wall->x, wall->y);
+    const int64_t b = orient2d(x0, y0, x1, y1, end->x, end->y);
+    const int64_t c = orient2d(wall->x, wall->y, end->x, end->y, x0, y0);
+    const int64_t d = orient2d(wall->x, wall->y, end->x, end->y, x1, y1);
+    return ((a > 0 && b < 0) || (a < 0 && b > 0)) &&
+           ((c > 0 && d < 0) || (c < 0 && d > 0));
+}
 
-    for (uint32_t i = 0; i < g_hdr->num_walls; i++) {
-        const s64_wall_t *w = &g_walls[i];
-        if (w->point2 < 0 || w->point2 >= g_hdr->num_walls) continue;
-        const s64_wall_t *w2 = &g_walls[w->point2];
-        int x1 = map_to_screen_x(w->x);
-        int y1 = map_to_screen_y(w->y);
-        int x2 = map_to_screen_x(w2->x);
-        int y2 = map_to_screen_y(w2->y);
-        graphics_draw_line(disp, x1, y1, x2, y2, w->nextsector >= 0 ? portal_color : wall_color);
+static bool movement_allowed(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                             int16_t current_sector, int16_t *new_sector) {
+    const int16_t candidate = find_sector(&g_map, x1, y1, current_sector);
+    if (candidate < 0) return false;
+    if (current_sector < 0 || current_sector >= g_map.sector_count) {
+        *new_sector = candidate;
+        return true;
     }
 
-    for (uint32_t i = 0; i < g_hdr->num_sprites; i++) {
-        int x = map_to_screen_x(g_sprites[i].x);
-        int y = map_to_screen_y(g_sprites[i].y);
-        graphics_draw_box(disp, x - 1, y - 1, 3, 3, sprite_color);
+    const map_sector_t *sector = &g_map.sectors[current_sector];
+    for (int n = 0; n < sector->wallnum; ++n) {
+        const map_wall_t *wall = &g_map.walls[sector->wallptr + n];
+        if (!movement_crosses_wall(x0, y0, x1, y1, wall)) continue;
+        const bool open_portal = wall->nextsector >= 0 && (wall->cstat & 1) == 0;
+        if (!open_portal || candidate != wall->nextsector) return false;
     }
 
-    int px = map_to_screen_x(cam_x);
-    int py = map_to_screen_y(cam_y);
-    graphics_draw_box(disp, px - 2, py - 2, 5, 5, player_color);
-
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-    int dx = (cs * 28) >> 10;
-    int dy = (sn * 28) >> 10;
-    graphics_draw_line(disp, px, py, px + dx, py + dy, player_color);
+    *new_sector = candidate;
+    return true;
 }
 
-static int cmp_render_wall(const void *a, const void *b) {
-    const render_wall_t *wa = (const render_wall_t*)a;
-    const render_wall_t *wb = (const render_wall_t*)b;
-    return wb->zavg - wa->zavg; /* far to near */
-}
+static void try_move(int32_t dx, int32_t dy) {
+    if (dx == 0 && dy == 0) return;
 
-static void add_projected_wall(render_wall_t *list, int *count, const s64_sector_t *s, const s64_wall_t *w) {
-    if (*count >= MAX_RENDER_WALLS) return;
-    if (w->point2 < 0 || w->point2 >= g_hdr->num_walls) return;
+    const int32_t old_x = g_player.x;
+    const int32_t old_y = g_player.y;
+    const int32_t wanted_x = old_x + dx;
+    const int32_t wanted_y = old_y + dy;
+    int16_t sector = g_player.sector;
 
-    const s64_wall_t *w2 = &g_walls[w->point2];
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-
-    int32_t dx1 = w->x - cam_x;
-    int32_t dy1 = w->y - cam_y;
-    int32_t dx2 = w2->x - cam_x;
-    int32_t dy2 = w2->y - cam_y;
-
-    int32_t x1 = ((int64_t)-dx1 * sn + (int64_t)dy1 * cs) >> 10;
-    int32_t z1 = ((int64_t) dx1 * cs + (int64_t)dy1 * sn) >> 10;
-    int32_t x2 = ((int64_t)-dx2 * sn + (int64_t)dy2 * cs) >> 10;
-    int32_t z2 = ((int64_t) dx2 * cs + (int64_t)dy2 * sn) >> 10;
-
-    if (z1 <= NEAR_Z && z2 <= NEAR_Z) return;
-    if (z1 > FAR_Z && z2 > FAR_Z) return;
-
-    if (z1 < NEAR_Z) {
-        int32_t dz = z2 - z1;
-        if (dz == 0) return;
-        int64_t num = NEAR_Z - z1;
-        x1 = x1 + (int32_t)(((int64_t)(x2 - x1) * num) / dz);
-        z1 = NEAR_Z;
-    }
-    if (z2 < NEAR_Z) {
-        int32_t dz = z1 - z2;
-        if (dz == 0) return;
-        int64_t num = NEAR_Z - z2;
-        x2 = x2 + (int32_t)(((int64_t)(x1 - x2) * num) / dz);
-        z2 = NEAR_Z;
-    }
-
-    int sx1 = SCREEN_W / 2 + (int)(((int64_t)x1 * FOCAL) / z1);
-    int sx2 = SCREEN_W / 2 + (int)(((int64_t)x2 * FOCAL) / z2);
-    if (sx1 == sx2) return;
-    if ((sx1 < 0 && sx2 < 0) || (sx1 >= SCREEN_W && sx2 >= SCREEN_W)) return;
-
-    int32_t cz = s->ceilingz - cam_z;
-    int32_t fz = s->floorz - cam_z;
-    int yceil1 = HORIZON + (int)((((int64_t)cz >> 8) * FOCAL) / z1);
-    int yfloor1 = HORIZON + (int)((((int64_t)fz >> 8) * FOCAL) / z1);
-    int yceil2 = HORIZON + (int)((((int64_t)cz >> 8) * FOCAL) / z2);
-    int yfloor2 = HORIZON + (int)((((int64_t)fz >> 8) * FOCAL) / z2);
-
-    render_wall_t *rw = &list[*count];
-    rw->sx1 = sx1;
-    rw->sx2 = sx2;
-    rw->yceil1 = yceil1;
-    rw->yceil2 = yceil2;
-    rw->yfloor1 = yfloor1;
-    rw->yfloor2 = yfloor2;
-    rw->zavg = (z1 + z2) >> 1;
-    rw->picnum = (uint16_t)w->picnum;
-    rw->pal = w->pal;
-    rw->portal = w->nextsector >= 0 ? 1 : 0;
-    (*count)++;
-}
-
-static void draw_projected_wall(surface_t *disp, const render_wall_t *rw) {
-    int sx1 = rw->sx1;
-    int sx2 = rw->sx2;
-    int yc1 = rw->yceil1;
-    int yc2 = rw->yceil2;
-    int yf1 = rw->yfloor1;
-    int yf2 = rw->yfloor2;
-    int flip = 0;
-
-    if (sx1 > sx2) {
-        int t;
-        t = sx1; sx1 = sx2; sx2 = t;
-        t = yc1; yc1 = yc2; yc2 = t;
-        t = yf1; yf1 = yf2; yf2 = t;
-        flip = 1;
-    }
-
-    int width = sx2 - sx1;
-    if (width <= 0) return;
-
-    const s64_tile_t *tile = find_tile(rw->picnum);
-    uint32_t fallback = graphics_make_color(80 + (rw->picnum & 63), 80 + ((rw->picnum >> 2) & 63), 100 + ((rw->picnum >> 4) & 95), 255);
-    if (rw->portal) fallback = graphics_make_color(35, 70, 110, 255);
-
-    int startx = sx1 < 0 ? 0 : sx1;
-    int endx = sx2 >= SCREEN_W ? SCREEN_W - 1 : sx2;
-
-    for (int x = startx; x <= endx; x++) {
-        int local = x - sx1;
-        int yceil = yc1 + (int)(((int64_t)(yc2 - yc1) * local) / width);
-        int yfloor = yf1 + (int)(((int64_t)(yf2 - yf1) * local) / width);
-        if (yceil > yfloor) {
-            int tmp = yceil; yceil = yfloor; yfloor = tmp;
+    if (movement_allowed(old_x, old_y, wanted_x, wanted_y, g_player.sector, &sector)) {
+        g_player.x = wanted_x;
+        g_player.y = wanted_y;
+        g_player.sector = sector;
+    } else {
+        if (movement_allowed(old_x, old_y, wanted_x, old_y, g_player.sector, &sector)) {
+            g_player.x = wanted_x;
+            g_player.sector = sector;
         }
-        if (yfloor < 0 || yceil >= SCREEN_H) continue;
-        int draw_y0 = yceil < 0 ? 0 : yceil;
-        int draw_y1 = yfloor >= SCREEN_H ? SCREEN_H - 1 : yfloor;
-        int wall_h = yfloor - yceil;
-        if (wall_h <= 0) continue;
+        if (movement_allowed(g_player.x, old_y, g_player.x, wanted_y, g_player.sector, &sector)) {
+            g_player.y = wanted_y;
+            g_player.sector = sector;
+        }
+    }
 
-        int u;
-        if (tile) {
-            u = ((int64_t)local * tile->w) / width;
-            if (flip) u = tile->w - 1 - u;
+    if (g_player.sector >= 0 && g_player.sector < g_map.sector_count) {
+        const int32_t desired_eye = g_map.sectors[g_player.sector].floorz - PLAYER_EYE_OFFSET;
+        g_player.z += (desired_eye - g_player.z) / 8;
+    }
+}
+
+static int outcode(int x, int y) {
+    int code = 0;
+    if (x < 0) code |= 1;
+    else if (x >= SCREEN_W) code |= 2;
+    if (y < 0) code |= 4;
+    else if (y >= SCREEN_H) code |= 8;
+    return code;
+}
+
+static void draw_clipped_line(surface_t *surface, int x0, int y0, int x1, int y1, uint32_t color) {
+    int code0 = outcode(x0, y0);
+    int code1 = outcode(x1, y1);
+
+    while (true) {
+        if ((code0 | code1) == 0) {
+            graphics_draw_line(surface, x0, y0, x1, y1, color);
+            return;
+        }
+        if ((code0 & code1) != 0) return;
+
+        const int code = code0 ? code0 : code1;
+        int x = 0;
+        int y = 0;
+
+        if (code & 8) {
+            if (y1 == y0) return;
+            x = x0 + (x1 - x0) * (SCREEN_H - 1 - y0) / (y1 - y0);
+            y = SCREEN_H - 1;
+        } else if (code & 4) {
+            if (y1 == y0) return;
+            x = x0 + (x1 - x0) * (0 - y0) / (y1 - y0);
+            y = 0;
+        } else if (code & 2) {
+            if (x1 == x0) return;
+            y = y0 + (y1 - y0) * (SCREEN_W - 1 - x0) / (x1 - x0);
+            x = SCREEN_W - 1;
         } else {
-            u = 0;
+            if (x1 == x0) return;
+            y = y0 + (y1 - y0) * (0 - x0) / (x1 - x0);
+            x = 0;
         }
 
-        for (int y = draw_y0; y <= draw_y1; y++) {
-            uint32_t color = fallback;
-            if (tile) {
-                int v = ((int64_t)(y - yceil) * tile->h) / wall_h;
-                uint8_t idx = tile_sample(tile, u, v);
-                color = g_pal_rgba[idx];
-                if (rw->portal) {
-                    /* Cheap darkening so pass-through walls read as debug portals. */
-                    if (((x ^ y) & 3) == 0) color = graphics_make_color(30, 70, 120, 255);
-                }
+        if (code == code0) {
+            x0 = x;
+            y0 = y;
+            code0 = outcode(x0, y0);
+        } else {
+            x1 = x;
+            y1 = y;
+            code1 = outcode(x1, y1);
+        }
+    }
+}
+
+static void render_overhead(surface_t *surface, uint32_t solid, uint32_t portal, uint32_t player_color) {
+    const float span_x = (float)(g_map.max_x - g_map.min_x);
+    const float span_y = (float)(g_map.max_y - g_map.min_y);
+    float scale_x = span_x > 0.0f ? 300.0f / span_x : 1.0f;
+    float scale_y = span_y > 0.0f ? 200.0f / span_y : 1.0f;
+    const float scale = scale_x < scale_y ? scale_x : scale_y;
+    const float center_x = ((float)g_map.min_x + (float)g_map.max_x) * 0.5f;
+    const float center_y = ((float)g_map.min_y + (float)g_map.max_y) * 0.5f;
+
+    for (int i = 0; i < g_map.wall_count; ++i) {
+        const map_wall_t *a = &g_map.walls[i];
+        const map_wall_t *b = &g_map.walls[a->point2];
+        const int x0 = (int)(160.0f + ((float)a->x - center_x) * scale);
+        const int y0 = (int)(120.0f + ((float)a->y - center_y) * scale);
+        const int x1 = (int)(160.0f + ((float)b->x - center_x) * scale);
+        const int y1 = (int)(120.0f + ((float)b->y - center_y) * scale);
+        draw_clipped_line(surface, x0, y0, x1, y1, a->nextsector >= 0 ? portal : solid);
+    }
+
+    const int px = (int)(160.0f + ((float)g_player.x - center_x) * scale);
+    const int py = (int)(120.0f + ((float)g_player.y - center_y) * scale);
+    graphics_draw_box(surface, px - 2, py - 2, 5, 5, player_color);
+    const float angle = (float)g_player.angle * BUILD_PI / 1024.0f;
+    const int hx = px + (int)(cosf(angle) * 12.0f);
+    const int hy = py + (int)(sinf(angle) * 12.0f);
+    draw_clipped_line(surface, px, py, hx, hy, player_color);
+}
+
+static bool clip_near(float *x1, float *z1, float *x2, float *z2) {
+    if (*z1 <= NEAR_PLANE && *z2 <= NEAR_PLANE) return false;
+    if (*z1 <= NEAR_PLANE) {
+        const float t = (NEAR_PLANE - *z1) / (*z2 - *z1);
+        *x1 += (*x2 - *x1) * t;
+        *z1 = NEAR_PLANE;
+    }
+    if (*z2 <= NEAR_PLANE) {
+        const float t = (NEAR_PLANE - *z2) / (*z1 - *z2);
+        *x2 += (*x1 - *x2) * t;
+        *z2 = NEAR_PLANE;
+    }
+    return true;
+}
+
+static int project_y(int32_t world_z, float depth) {
+    const float vertical = (float)(world_z - g_player.z) / 16.0f;
+    return (int)(120.0f + vertical * 120.0f / depth);
+}
+
+static void render_first_person(surface_t *surface, uint32_t solid, uint32_t portal, uint32_t horizon) {
+    graphics_draw_line(surface, 0, 120, SCREEN_W - 1, 120, horizon);
+
+    const float angle = (float)g_player.angle * BUILD_PI / 1024.0f;
+    const float forward_x = cosf(angle);
+    const float forward_y = sinf(angle);
+    const float right_x = -forward_y;
+    const float right_y = forward_x;
+
+    for (int i = 0; i < g_map.wall_count; ++i) {
+        const map_wall_t *wall = &g_map.walls[i];
+        const map_wall_t *end = &g_map.walls[wall->point2];
+        const int owner = wall->owner_sector;
+        if (owner < 0 || owner >= g_map.sector_count) continue;
+
+        const float dx1 = (float)(wall->x - g_player.x);
+        const float dy1 = (float)(wall->y - g_player.y);
+        const float dx2 = (float)(end->x - g_player.x);
+        const float dy2 = (float)(end->y - g_player.y);
+        float cam_x1 = dx1 * right_x + dy1 * right_y;
+        float cam_z1 = dx1 * forward_x + dy1 * forward_y;
+        float cam_x2 = dx2 * right_x + dy2 * right_y;
+        float cam_z2 = dx2 * forward_x + dy2 * forward_y;
+        if (!clip_near(&cam_x1, &cam_z1, &cam_x2, &cam_z2)) continue;
+
+        const int sx1 = (int)(160.0f + cam_x1 * 150.0f / cam_z1);
+        const int sx2 = (int)(160.0f + cam_x2 * 150.0f / cam_z2);
+        const map_sector_t *sector = &g_map.sectors[owner];
+        const int ceil_y1 = project_y(sector->ceilingz, cam_z1);
+        const int ceil_y2 = project_y(sector->ceilingz, cam_z2);
+        const int floor_y1 = project_y(sector->floorz, cam_z1);
+        const int floor_y2 = project_y(sector->floorz, cam_z2);
+        const uint32_t color = wall->nextsector >= 0 ? portal : solid;
+
+        draw_clipped_line(surface, sx1, ceil_y1, sx2, ceil_y2, color);
+        draw_clipped_line(surface, sx1, floor_y1, sx2, floor_y2, color);
+        if (wall->nextsector < 0 || (wall->cstat & 1) != 0) {
+            draw_clipped_line(surface, sx1, ceil_y1, sx1, floor_y1, color);
+            draw_clipped_line(surface, sx2, ceil_y2, sx2, floor_y2, color);
+        } else if (wall->nextsector < g_map.sector_count) {
+            const map_sector_t *next = &g_map.sectors[wall->nextsector];
+            const int next_ceil_y1 = project_y(next->ceilingz, cam_z1);
+            const int next_ceil_y2 = project_y(next->ceilingz, cam_z2);
+            const int next_floor_y1 = project_y(next->floorz, cam_z1);
+            const int next_floor_y2 = project_y(next->floorz, cam_z2);
+            if (next->ceilingz > sector->ceilingz) {
+                draw_clipped_line(surface, sx1, next_ceil_y1, sx2, next_ceil_y2, color);
             }
-            graphics_draw_pixel(disp, x, y, color);
-        }
-    }
-}
-
-static void render_first_person(surface_t *disp) {
-    uint32_t sky = graphics_make_color(20, 24, 34, 255);
-    uint32_t ground = graphics_make_color(30, 26, 20, 255);
-    graphics_draw_box(disp, 0, 0, SCREEN_W, HORIZON, sky);
-    graphics_draw_box(disp, 0, HORIZON, SCREEN_W, SCREEN_H - HORIZON, ground);
-
-    render_wall_t list[MAX_RENDER_WALLS];
-    int count = 0;
-    for (uint32_t si = 0; si < g_hdr->num_sectors; si++) {
-        const s64_sector_t *s = &g_sectors[si];
-        int start = s->wallptr;
-        int end = s->wallptr + s->wallnum;
-        if (start < 0 || end > g_hdr->num_walls) continue;
-        for (int wi = start; wi < end; wi++) {
-            add_projected_wall(list, &count, s, &g_walls[wi]);
+            if (next->floorz < sector->floorz) {
+                draw_clipped_line(surface, sx1, next_floor_y1, sx2, next_floor_y2, color);
+            }
         }
     }
 
-    qsort(list, count, sizeof(list[0]), cmp_render_wall);
-    for (int i = 0; i < count; i++) {
-        draw_projected_wall(disp, &list[i]);
-    }
-    g_last_render_walls = count;
-
-    uint32_t cross = graphics_make_color(255, 255, 255, 255);
-    graphics_draw_line(disp, SCREEN_W / 2 - 4, SCREEN_H / 2, SCREEN_W / 2 + 4, SCREEN_H / 2, cross);
-    graphics_draw_line(disp, SCREEN_W / 2, SCREEN_H / 2 - 4, SCREEN_W / 2, SCREEN_H / 2 + 4, cross);
+    graphics_draw_line(surface, 156, 120, 164, 120, solid);
+    graphics_draw_line(surface, 160, 116, 160, 124, solid);
 }
 
-static void render_debug(surface_t *disp) {
-    char line[128];
-    graphics_draw_text(disp, 8, 8, "Shadow64 Phase 0 R11 SOFTWARE / $DMWOODS.MAP");
-    snprintf(line, sizeof(line), "view:%s sectors:%u walls:%u sprites:%lu tiles:%lu",
-        view_mode == 0 ? "first-person" : "top-down",
-        g_hdr->num_sectors, g_hdr->num_walls,
-        (unsigned long)g_hdr->num_sprites, (unsigned long)g_hdr->tile_count);
-    graphics_draw_text(disp, 8, 20, line);
+static void update_input(void) {
+    joypad_poll();
+    const joypad_inputs_t input = joypad_get_inputs(JOYPAD_PORT_1);
+    const joypad_buttons_t pressed = joypad_get_buttons_pressed(JOYPAD_PORT_1);
 
-    snprintf(line, sizeof(line), "x:%ld y:%ld z:%ld ang:%u drawn:%d",
-        (long)cam_x, (long)cam_y, (long)cam_z, cam_ang, g_last_render_walls);
-    graphics_draw_text(disp, 8, 32, line);
-    graphics_draw_text(disp, 8, 44, "renderer: software CPU columns / libdragon trunk / GL disabled");
+    if (pressed.start) reset_player();
+    if (pressed.a) g_overhead = !g_overhead;
 
-    if (show_help) {
-        graphics_draw_text(disp, 8, 204, "Dpad up/down move  Dpad left/right strafe");
-        graphics_draw_text(disp, 8, 216, "C-left/C-right turn  A reset  B switch view");
-        graphics_draw_text(disp, 8, 228, "R11 = CPU software renderer only; no OpenGL/preview path");
-    }
+    int turn = input.stick_x;
+    if (input.btn.d_left) turn -= 55;
+    if (input.btn.d_right) turn += 55;
+    g_player.angle = (int16_t)((g_player.angle + turn / 5) & (BUILD_ANGLE_COUNT - 1));
+
+    int forward = input.stick_y;
+    if (input.btn.d_up) forward += 70;
+    if (input.btn.d_down) forward -= 70;
+    int strafe = 0;
+    if (input.btn.c_left || input.btn.l) strafe -= 70;
+    if (input.btn.c_right || input.btn.r) strafe += 70;
+
+    if (abs(forward) < 8) forward = 0;
+    if (abs(strafe) < 8) strafe = 0;
+    const int speed = input.btn.z ? 18 : 10;
+    const float angle = (float)g_player.angle * BUILD_PI / 1024.0f;
+    const float forward_x = cosf(angle);
+    const float forward_y = sinf(angle);
+    const float right_x = -forward_y;
+    const float right_y = forward_x;
+    const int32_t dx = (int32_t)((forward_x * (float)forward + right_x * (float)strafe) * (float)speed);
+    const int32_t dy = (int32_t)((forward_y * (float)forward + right_y * (float)strafe) * (float)speed);
+    try_move(dx, dy);
 }
 
-static void load_bank(void) {
-    dfs_init(DFS_DEFAULT_LOCATION);
+static void render_frame(void) {
+    surface_t *surface = display_get();
+    const uint32_t black = color_to_packed16(RGBA32(0, 0, 0, 255));
+    const uint32_t white = color_to_packed16(RGBA32(230, 230, 230, 255));
+    const uint32_t red = color_to_packed16(RGBA32(255, 70, 70, 255));
+    const uint32_t green = color_to_packed16(RGBA32(70, 255, 120, 255));
+    const uint32_t blue = color_to_packed16(RGBA32(80, 150, 255, 255));
+    const uint32_t gray = color_to_packed16(RGBA32(70, 70, 70, 255));
 
-    int fp = dfs_open(BANK_PATH);
-    if (fp < 0) return;
-
-    int size = dfs_size(fp);
-    g_bank = malloc(size);
-    if (!g_bank) {
-        dfs_close(fp);
-        return;
-    }
-    dfs_read(g_bank, 1, size, fp);
-    dfs_close(fp);
-
-    g_hdr = (const s64_bank_header_t*)g_bank;
-    if (memcmp(g_hdr->magic, "S64B", 4) != 0 || g_hdr->version != 1) {
-        free(g_bank);
-        g_bank = NULL;
-        g_hdr = NULL;
-        return;
+    graphics_fill_screen(surface, black);
+    if (g_map.walls) {
+        if (g_overhead) render_overhead(surface, white, blue, green);
+        else render_first_person(surface, white, blue, gray);
     }
 
-    g_palette = g_bank + g_hdr->palette_offset;
-    g_sectors = (const s64_sector_t*)(g_bank + g_hdr->map_offset);
-    g_walls = (const s64_wall_t*)((const uint8_t*)g_sectors + g_hdr->num_sectors * sizeof(s64_sector_t));
-    g_sprites = (const s64_sprite_t*)((const uint8_t*)g_walls + g_hdr->num_walls * sizeof(s64_wall_t));
-    g_tiles = (const s64_tile_t*)(g_bank + g_hdr->tile_dir_offset);
-    g_tile_pixels = g_bank + g_hdr->tile_data_offset;
-    rebuild_palette_cache();
+    graphics_set_color(g_map.walls ? green : red, black);
+    graphics_draw_text(surface, 8, 8, "SHADOW64 R11 MAP CORE");
+    graphics_set_color(white, black);
+    graphics_draw_text(surface, 8, 20, g_status);
 
-    cam_x = g_hdr->start_x;
-    cam_y = g_hdr->start_y;
-    cam_z = g_hdr->start_z;
-    cam_ang = g_hdr->start_ang;
-}
-
-static void reset_camera(void) {
-    if (!g_hdr) return;
-    cam_x = g_hdr->start_x;
-    cam_y = g_hdr->start_y;
-    cam_z = g_hdr->start_z;
-    cam_ang = g_hdr->start_ang;
-    zoom = 6;
-}
-
-static void update_controls(void) {
-    struct controller_data held = get_keys_held();
-    struct controller_data down = get_keys_down();
-
-    if (!g_hdr) return;
-
-    int16_t cs = icos1024(cam_ang);
-    int16_t sn = isin1024(cam_ang);
-    int speed = 96;
-    if (held.c[0].up) {
-        cam_x += ((int32_t)cs * speed) >> 10;
-        cam_y += ((int32_t)sn * speed) >> 10;
-    }
-    if (held.c[0].down) {
-        cam_x -= ((int32_t)cs * speed) >> 10;
-        cam_y -= ((int32_t)sn * speed) >> 10;
-    }
-    if (held.c[0].left) {
-        cam_x += ((int32_t)sn * speed) >> 10;
-        cam_y -= ((int32_t)cs * speed) >> 10;
-    }
-    if (held.c[0].right) {
-        cam_x -= ((int32_t)sn * speed) >> 10;
-        cam_y += ((int32_t)cs * speed) >> 10;
-    }
-    if (held.c[0].C_left) cam_ang -= 12;
-    if (held.c[0].C_right) cam_ang += 12;
-    if (held.c[0].C_up && view_mode == 1 && zoom > 2) zoom--;
-    if (held.c[0].C_down && view_mode == 1 && zoom < 12) zoom++;
-
-    if (down.c[0].A) reset_camera();
-    if (down.c[0].B) view_mode = !view_mode;
+    char line[96];
+    snprintf(line, sizeof(line), "X:%ld Y:%ld ANG:%d SEC:%d %s",
+             (long)g_player.x, (long)g_player.y, g_player.angle,
+             g_player.sector, g_overhead ? "MAP" : "3D");
+    graphics_draw_text(surface, 8, 220, line);
+    display_show(surface);
 }
 
 int main(void) {
-    display_init(RESOLUTION_320x240, DEPTH_16_BPP, 2, GAMMA_NONE, FILTERS_RESAMPLE);
-    controller_init();
+    debug_init_isviewer();
+    debug_init_usblog();
+    display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE);
+    joypad_init();
 
-    bool expanded = get_memory_size() >= 8 * 1024 * 1024;
-    load_bank();
-
-    while (1) {
-        controller_scan();
-        update_controls();
-
-        surface_t *disp = display_get();
-        graphics_fill_screen(disp, graphics_make_color(0, 0, 0, 255));
-
-        if (!expanded) {
-            graphics_draw_text(disp, 40, 100, "Expansion Pak required.");
-            graphics_draw_text(disp, 40, 116, "Shadow64 is 8MB-only.");
-        } else if (!g_hdr) {
-            graphics_draw_text(disp, 24, 100, "Could not load /dmwoods.s64b from DFS.");
-            graphics_draw_text(disp, 24, 116, "Check Makefile/DFS asset packing.");
-        } else {
-            if (view_mode == 0) {
-                render_first_person(disp);
-            } else {
-                render_topdown(disp);
-                draw_tile_preview(disp, 248, 48, g_tiles[0].picnum, 1);
-            }
-            render_debug(disp);
-        }
-
-        display_show(disp);
+    const int dfs_result = dfs_init(DFS_DEFAULT_LOCATION);
+    if (dfs_result != DFS_ESUCCESS) {
+        snprintf(g_status, sizeof(g_status), "DFS ERROR: %s", dfs_strerror(dfs_result));
+    } else if (load_map(MAP_PATH, &g_map)) {
+        reset_player();
     }
 
-    return 0;
+    while (true) {
+        if (g_map.walls) update_input();
+        render_frame();
+    }
 }
